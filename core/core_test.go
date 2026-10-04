@@ -1,6 +1,7 @@
 package core
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -349,5 +350,109 @@ func TestSnapshotRetention(t *testing.T) {
 	d, f := s2.PruneAutoSnapshots()
 	if d != 0 || f != 0 {
 		t.Fatalf("没有可清理时应返回 0，got %d/%d", d, f)
+	}
+}
+
+func TestWriteLockExclusive(t *testing.T) {
+	s := testStore(t, "127.0.0.1 localhost\n")
+	l1, err := LockWrite(s.DataDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer l1.Unlock()
+	// 第二个锁必须拿不到
+	if _, err := LockWrite(s.DataDir); !errors.Is(err, ErrWriteLocked) {
+		t.Fatalf("第二个写入锁应该被拒绝，实际：%v", err)
+	}
+	// 释放后能拿到
+	if err := l1.Unlock(); err != nil {
+		t.Fatal(err)
+	}
+	l2, err := LockWrite(s.DataDir)
+	if err != nil {
+		t.Fatalf("释放后应能拿到锁：%v", err)
+	}
+	l2.Unlock()
+}
+
+func TestApplyWhileLocked(t *testing.T) {
+	s := testStore(t, "127.0.0.1 localhost\n")
+	lk, err := LockWrite(s.DataDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lk.Unlock()
+	// 锁被占时写入应直接拒绝，而不是卡住
+	_, err = s.ApplyHosts("127.0.0.1 localhost\n1.2.3.4 example.com\n", "测试")
+	if !errors.Is(err, ErrWriteLocked) {
+		t.Fatalf("锁定时写入应报 ErrWriteLocked，实际：%v", err)
+	}
+}
+
+func TestUndoRoundTrip(t *testing.T) {
+	s := testStore(t, "127.0.0.1 localhost\n")
+	before := "127.0.0.1 localhost\n"
+	after := "127.0.0.1 localhost\n9.9.9.9 dns.example\n"
+	if _, err := s.ApplyHosts(after, "测试写入"); err != nil {
+		t.Fatal(err)
+	}
+	// 有撤销点
+	la, ok := s.LastApplyState()
+	if !ok {
+		t.Fatal("写入后应有撤销点")
+	}
+	if la.Actor != "测试写入" {
+		t.Fatalf("撤销点记录的操作不对：%s", la.Actor)
+	}
+	// 撤销回到之前
+	if _, err := s.Undo(); err != nil {
+		t.Fatal(err)
+	}
+	cur, _ := s.ReadCurrentHosts()
+	if cur != NormalizeHosts(before) {
+		t.Fatalf("撤销后内容不对：%q", cur)
+	}
+	// 撤销后产生新撤销点（可来回切换 = 重做）
+	la2, ok := s.LastApplyState()
+	if !ok {
+		t.Fatal("撤销后应产生新的撤销点")
+	}
+	if la2.SnapshotID == la.SnapshotID {
+		t.Fatal("撤销后的撤销点应该指向新快照")
+	}
+	if _, err := s.Undo(); err != nil {
+		t.Fatal(err)
+	}
+	cur, _ = s.ReadCurrentHosts()
+	if cur != NormalizeHosts(after) {
+		t.Fatalf("再次撤销（重做）后内容不对：%q", cur)
+	}
+}
+
+func TestUndoNothing(t *testing.T) {
+	s := testStore(t, "127.0.0.1 localhost\n")
+	if _, err := s.Undo(); err == nil {
+		t.Fatal("没有写入过时撤销应报错")
+	}
+}
+
+func TestUndoAfterSnapshotDeleted(t *testing.T) {
+	s := testStore(t, "127.0.0.1 localhost\n")
+	if _, err := s.ApplyHosts("127.0.0.1 localhost\n1.1.1.1 one.example\n", "测试"); err != nil {
+		t.Fatal(err)
+	}
+	la, ok := s.LastApplyState()
+	if !ok {
+		t.Fatal("应有撤销点")
+	}
+	// 手动删掉撤销用的快照
+	if err := s.DeleteSnapshot(la.SnapshotID); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := s.LastApplyState(); ok {
+		t.Fatal("快照被删后撤销点应失效")
+	}
+	if _, err := s.Undo(); err == nil {
+		t.Fatal("快照被删后撤销应报错")
 	}
 }

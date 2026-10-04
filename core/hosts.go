@@ -163,6 +163,14 @@ func NormalizeHosts(content string) string {
 	return out
 }
 
+// CountLines 返回文本行数（空文本计 0 行），用于恢复/撤销前的行数对比展示。
+func CountLines(content string) int {
+	if strings.TrimSpace(content) == "" {
+		return 0
+	}
+	return len(strings.Split(strings.TrimRight(strings.ReplaceAll(content, "\r\n", "\n"), "\n"), "\n"))
+}
+
 // CountStats 返回行数/有效条目数，给 UI 展示用。
 func CountStats(content string) (total, active int) {
 	for _, l := range strings.Split(strings.ReplaceAll(content, "\r\n", "\n"), "\n") {

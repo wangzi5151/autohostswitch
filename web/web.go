@@ -74,6 +74,9 @@ func (sv *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/diff", sv.handleDiff)
 	mux.HandleFunc("GET /api/snapshots/usage", sv.handleSnapshotsUsage)
 	mux.HandleFunc("POST /api/snapshots/prune", sv.handlePruneSnapshots)
+
+	mux.HandleFunc("GET /api/undo-state", sv.handleUndoState)
+	mux.HandleFunc("POST /api/undo", sv.handleUndo)
 	return csrfGuard(mux)
 }
 
@@ -275,6 +278,10 @@ func (sv *Server) handleListSnapshots(w http.ResponseWriter, r *http.Request) {
 	for _, s := range list {
 		m := snapJSON(s)
 		m["is_original"] = s.ID == orig
+		// 行数：恢复前确认时展示“当前 N 行 vs 快照 M 行”
+		if content, err := sv.Store.SnapshotContent(&s); err == nil {
+			m["lines"] = core.CountLines(string(content))
+		}
 		out = append(out, m)
 	}
 	writeJSON(w, 200, out)
@@ -542,4 +549,29 @@ func (sv *Server) handleSnapshotsUsage(w http.ResponseWriter, r *http.Request) {
 func (sv *Server) handlePruneSnapshots(w http.ResponseWriter, r *http.Request) {
 	d, f := sv.Store.PruneAutoSnapshots()
 	writeJSON(w, 200, map[string]any{"ok": "true", "deleted": d, "freed_bytes": f})
+}
+
+// handleUndoState 返回当前是否可撤销（GET，无副作用）。
+func (sv *Server) handleUndoState(w http.ResponseWriter, r *http.Request) {
+	la, ok := sv.Store.LastApplyState()
+	if !ok {
+		writeJSON(w, 200, map[string]any{"can_undo": false})
+		return
+	}
+	writeJSON(w, 200, map[string]any{
+		"can_undo":      true,
+		"actor":         la.Actor,
+		"at":            la.At,
+		"snapshot_name": la.SnapshotName,
+	})
+}
+
+// handleUndo 撤销上一次写入（POST，副作用操作，受 CSRF 保护）。
+func (sv *Server) handleUndo(w http.ResponseWriter, r *http.Request) {
+	res, err := sv.Store.Undo()
+	if err != nil {
+		writeErr(w, errCode(err), err.Error())
+		return
+	}
+	writeJSON(w, 200, map[string]any{"ok": "true", "steps": res.Steps, "warnings": res.Warnings})
 }

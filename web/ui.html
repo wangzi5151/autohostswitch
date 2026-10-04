@@ -97,6 +97,7 @@ footer{color:var(--muted);font-size:12px;padding:0 20px 30px;max-width:1060px}
         <button class="btn primary" id="btn-save">保存并应用</button>
         <button class="btn" id="btn-reload">重新读取</button>
         <button class="btn" id="btn-copy">复制提权命令</button>
+        <button class="btn" id="btn-undo" title="撤销上一次写入，回到写入前的状态">撤销上一次</button>
       </div>
       <div id="save-msg"></div>
     </div>
@@ -318,15 +319,17 @@ async function loadSnapUsage(){
 }
 async function loadSnaps(){
   const list=await api("/api/snapshots");
+  window.snapList=list;
   loadSnapUsage().catch(()=>{});
   const box=$("snap-list");
   if(list.length===0){box.innerHTML='<span class="muted">还没有快照，先新建一个吧。</span>';return;}
-  let h='<table><tr><th>名字</th><th>备注</th><th>创建时间</th><th>操作</th></tr>';
+  let h='<table><tr><th>名字</th><th>备注</th><th>创建时间</th><th>行数</th><th>操作</th></tr>';
   for(const s of list){
     h+="<tr><td>"+esc(s.name)+
       (s.is_original?' <span class="tag orig">原始备份</span>':"")+
       (s.auto?' <span class="tag auto">自动</span>':"")+"</td><td>"+
       esc(s.note||"—")+"</td><td>"+esc(s.created_at)+"</td><td>"+
+      (s.lines!=null?s.lines+" 行":"")+"</td><td>"+
       '<button class="btn" data-act="restore" data-id="'+s.id+'">恢复</button> '+
       '<button class="btn" data-act="diff" data-id="'+s.id+'">对比当前</button> '+
       '<button class="btn" data-act="rename" data-id="'+s.id+'">重命名</button> '+
@@ -340,9 +343,14 @@ async function loadSnaps(){
 async function snapAct(act,id){
   try{
     if(act==="restore"){
-      if(!confirmIt("确定把 hosts 恢复到这个快照吗？恢复前会自动再存一份当前状态。"))return;
+      const sl=window.snapList||[];
+      const s=sl.find(x=>x.id===id);
+      const curLines=$("ta").value?$("ta").value.split("\n").length:0;
+      const tgt=s&&s.lines!=null?s.lines:"?";
+      if(!confirmIt("确定从快照恢复？\n\n当前 hosts："+curLines+" 行\n目标快照："+tgt+" 行"+
+        (s?"（"+s.name+"）":"")+"\n\n恢复后当前修改将被覆盖（恢复前会自动再存一份安全快照）。"))return;
       const r=await api("/api/snapshots/"+id+"/restore","POST");
-      alert("已恢复。"+stepsText(r)+(r.warnings?"\n"+r.warnings:"")); loadHosts(); loadSnaps();
+      alert("已恢复。"+stepsText(r)+(r.warnings?"\n"+r.warnings:"")); loadHosts(); loadSnaps(); loadUndoState();
     }else if(act==="rename"){
       const name=prompt("新名字："); if(!name)return;
       const note=prompt("备注（可空）：")||"";
@@ -389,7 +397,7 @@ async function profAct(act,id){
         if(!confirmIt("应用后将：+"+d.added+" 行 / -"+d.removed+" 行\n\n"+preview+more+"\n\n确定应用吗？应用前会自动备份当前 hosts。"))return;
       }catch(e){ if(!confirmIt("diff 预览失败（"+e.message+"），仍要应用吗？"))return; }
       const r=await api("/api/profiles/"+id+"/apply","POST");
-      alert("已应用。"+stepsText(r)+(r.warnings?"\n"+r.warnings:"")); loadHosts();
+      alert("已应用。"+stepsText(r)+(r.warnings?"\n"+r.warnings:"")); loadHosts(); loadUndoState();
     }else if(act==="edit"){
       const r=await api("/api/profiles/"+id);
       const c=prompt("编辑配置内容（完整 hosts 文本）：",r.content);
@@ -446,11 +454,34 @@ function bind(){
     try{
       const r=await api("/api/hosts","POST",{content:ta.value,expected_hash:window.hostsHash||""});
       showMsg($("save-msg"),true,("保存成功，hosts 已更新。"+stepsText(r)+(r.warnings?"\n"+r.warnings:"")));
-      loadHosts(); loadStatus();
+      loadHosts(); loadStatus(); loadUndoState();
     }catch(e){
       // 409 = 并发冲突：hosts 在你编辑期间被外部改过
       showMsg($("save-msg"),false,e.message+"（如提示被外部修改，请点“重新读取”后再操作）");
     }
+  };
+  async function loadUndoState(){
+    try{
+      const st=await api("/api/undo-state");
+      const b=$("btn-undo");
+      if(st.can_undo){
+        b.disabled=false;
+        b.title="撤销："+st.actor+"（"+st.at+"），回到「"+st.snapshot_name+"」";
+      }else{
+        b.disabled=true;
+        b.title="没有可撤销的操作";
+      }
+    }catch(e){/* 忽略，后端旧版本也可能没这个接口 */}
+  }
+  $("btn-undo").onclick=async()=>{
+    try{
+      const st=await api("/api/undo-state");
+      if(!st.can_undo){alert("没有可撤销的操作。");return;}
+      if(!confirmIt("撤销上一次操作？\n\n将撤销："+st.actor+"（"+st.at+"）\n回到快照：「"+st.snapshot_name+"」"))return;
+      const r=await api("/api/undo","POST");
+      showMsg($("save-msg"),true,("已撤销上一次操作。"+stepsText(r)+(r.warnings?"\n"+r.warnings:"")));
+      loadHosts(); loadStatus(); loadUndoState();
+    }catch(e){showMsg($("save-msg"),false,e.message);}
   };
   $("btn-prune").onclick=async()=>{
     if(!confirmIt("清理超出保留上限的旧自动快照？手动快照和原始备份不受影响。"))return;
@@ -496,7 +527,7 @@ function bind(){
     try{
       const r=await api("/api/restore-original","POST");
       showMsg($("restore-msg"),true,r.warnings?("已恢复为系统原始 hosts。\n"+r.warnings):"已恢复为系统原始 hosts。");
-      loadHosts();
+      loadHosts(); loadUndoState();
     }catch(e){showMsg($("restore-msg"),false,e.message);}
   };
   $("btn-log-reload").onclick=loadLog;
@@ -526,7 +557,7 @@ function bind(){
       if(ab)ab.onclick=async()=>{
         try{
           const rr=await api("/api/hosts","POST",{content:r.content});
-          alert(rr.warnings?("已应用。\n"+rr.warnings):"订阅已应用到 hosts。");loadHosts();
+          alert(rr.warnings?("已应用。\n"+rr.warnings):"订阅已应用到 hosts。");loadHosts();loadUndoState();
         }catch(e){alert("失败："+e.message);}
       };
     }catch(e){box.innerHTML='<div class="errmsg">'+esc(e.message)+"</div>";}
@@ -538,7 +569,7 @@ function bind(){
   try{await loadStatus();}catch(e){document.body.insertAdjacentHTML("afterbegin",
     '<div class="errmsg" style="margin:12px 20px">连接后端失败：'+esc(e.message)+"</div>");return;}
   loadHosts().catch(()=>{});
-  loadSnaps().catch(()=>{}); loadProfs().catch(()=>{});
+  loadSnaps().catch(()=>{}); loadProfs().catch(()=>{}); loadUndoState().catch(()=>{});
 })();
 </script>
 </body>

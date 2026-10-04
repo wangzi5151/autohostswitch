@@ -81,6 +81,10 @@ func (s *Store) ApplyHosts(content, actor string) (*ApplyResult, error) {
 // ApplyHostsGuarded 同 ApplyHosts，但多一层并发保护：
 // expectHash 非空时，要求写入瞬间的文件哈希与它一致，否则报 ConcurrentChangeError。
 // 调用方应在“用户看到内容的那一刻”计算哈希并传入。
+//
+// 写入临界区（哈希复核 → 安全快照 → 原子写入）持有进程间写入锁，
+// 防止同一台机器上的另一个 AutoHostSwitch（CLI/Web）同时写入。
+// 外部编辑器不走本锁，那种情况仍由哈希比对兜底。
 func (s *Store) ApplyHostsGuarded(content, actor, expectHash string) (*ApplyResult, error) {
 	res := &ApplyResult{}
 	issues := ValidateHosts(content)
@@ -90,11 +94,17 @@ func (s *Store) ApplyHostsGuarded(content, actor, expectHash string) (*ApplyResu
 	content = NormalizeHosts(content)
 	res.Steps = append(res.Steps, "已通过语法校验")
 
+	lk, err := LockWrite(s.DataDir)
+	if err != nil {
+		return nil, err // ErrWriteLocked 会直接告诉用户稍后再试
+	}
+	defer lk.Unlock()
+
 	current, err := os.ReadFile(s.HostsPath)
 	if err != nil && !os.IsNotExist(err) {
 		return nil, fmt.Errorf("读取当前 hosts 失败：%w", err)
 	}
-	// 并发修改检测：用户所见版本 vs 即将覆盖的版本
+	// 并发修改检测：用户所见版本 vs 即将覆盖的版本（锁内复核，防止检查与写入之间被插队）
 	if expectHash != "" && HashHosts(string(current)) != expectHash {
 		return nil, &ConcurrentChangeError{}
 	}
@@ -112,7 +122,8 @@ func (s *Store) ApplyHostsGuarded(content, actor, expectHash string) (*ApplyResu
 	}
 
 	// 覆盖前自动生成安全快照（内容无变化时内部会跳过）
-	if err := s.createSafetySnapshot(current); err != nil {
+	safety, err := s.createSafetySnapshot(current)
+	if err != nil {
 		return nil, fmt.Errorf("生成安全快照失败，为保护你的 hosts 已中止写入：%w", err)
 	}
 	res.Steps = append(res.Steps, "已生成安全快照")
@@ -127,6 +138,8 @@ func (s *Store) ApplyHostsGuarded(content, actor, expectHash string) (*ApplyResu
 	if w := WarningsText(issues); w != "" {
 		res.Warnings = w
 	}
+	// 记录“上一次写入”，供“撤销”使用（快照 ID + 操作描述）
+	s.recordLastApply(safety, actor)
 	return res, nil
 }
 

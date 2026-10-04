@@ -197,23 +197,27 @@ func (s *Store) RestoreOriginal() (*ApplyResult, error) {
 
 // createSafetySnapshot 在覆盖前自动生成安全快照。
 // 如果当前内容与最近一次自动快照完全一致则跳过，避免快照泛滥。
-func (s *Store) createSafetySnapshot(current []byte) error {
+// 返回实际创建的快照（跳过时返回 nil），供“撤销上一次操作”记录。
+func (s *Store) createSafetySnapshot(current []byte) (*Snapshot, error) {
 	list, err := s.loadSnapshots()
 	if err != nil {
-		return err
+		return nil, err
 	}
 	for _, snap := range list {
 		if !snap.Auto {
 			continue
 		}
 		if data, err := os.ReadFile(s.snapFile(snap.ID)); err == nil && string(data) == string(current) {
-			return nil // 已经有一份一模一样的安全快照，跳过
+			return &snap, nil // 已经有一份一模一样的安全快照，直接复用它
 		}
 		break // 只看最新的一份自动快照
 	}
-	_, err = s.CreateSnapshotOfContent("自动安全快照 "+nowStr(),
+	snap, err := s.CreateSnapshotOfContent("自动安全快照 "+nowStr(),
 		"写入 hosts 前自动生成，防止改错变砖", current, true)
-	return err
+	if err != nil {
+		return nil, err
+	}
+	return snap, nil
 }
 
 // RestoreSnapshotGuarded 同 RestoreSnapshot，多一层并发保护。

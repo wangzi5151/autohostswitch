@@ -77,7 +77,9 @@ func Run(args []string, version string) int {
 	case "restore":
 		return cmdRestore(store, cargs)
 	case "restore-original":
-		return cmdRestoreOriginal(store)
+		return cmdRestoreOriginal(store, cargs)
+	case "undo":
+		return cmdUndo(store)
 	case "profiles":
 		return cmdListProfiles(store)
 	case "apply":
@@ -262,10 +264,36 @@ func cmdListSnapshots(store *core.Store) int {
 }
 
 func cmdRestore(store *core.Store, args []string) int {
-	if len(args) == 0 {
-		return fail("用法：autohostswitch restore <快照名或ID>")
+	yes := false
+	var names []string
+	for _, a := range args {
+		if a == "--yes" {
+			yes = true
+		} else {
+			names = append(names, a)
+		}
 	}
-	res, err := store.RestoreSnapshotGuarded(args[0], currentHash(store))
+	if len(names) == 0 {
+		return fail("用法：autohostswitch restore <快照名或ID> [--yes]")
+	}
+	snap, err := store.GetSnapshot(names[0])
+	if err != nil {
+		return exitFor(err)
+	}
+	if !yes {
+		cur, _ := store.ReadCurrentHosts()
+		target, _ := store.SnapshotContent(snap)
+		fmt.Printf("确定从快照「%s」恢复？\n", snap.Name)
+		fmt.Printf("  当前 hosts：%d 行\n  目标快照：%d 行（%s）\n",
+			core.CountLines(cur), core.CountLines(string(target)), snap.CreatedAt)
+		fmt.Println("恢复后当前修改将被覆盖（恢复前会自动再存一份安全快照）。")
+		fmt.Print("确认恢复？(y/N)：")
+		if !confirm() {
+			fmt.Println("已取消。")
+			return 0
+		}
+	}
+	res, err := store.RestoreSnapshotGuarded(names[0], currentHash(store))
 	if err != nil {
 		return exitFor(err)
 	}
@@ -273,12 +301,51 @@ func cmdRestore(store *core.Store, args []string) int {
 	return 0
 }
 
-func cmdRestoreOriginal(store *core.Store) int {
+func cmdRestoreOriginal(store *core.Store, args []string) int {
+	yes := false
+	for _, a := range args {
+		if a == "--yes" {
+			yes = true
+		}
+	}
+	if !yes {
+		cur, _ := store.ReadCurrentHosts()
+		fmt.Println("⚠ 紧急恢复：将 hosts 还原为首次运行时的系统原始备份。")
+		fmt.Printf("  当前 hosts：%d 行\n", core.CountLines(cur))
+		fmt.Println("恢复后当前所有修改都将被覆盖（恢复前会自动存一份安全快照）。")
+		fmt.Print("确认还原为系统原始 hosts？(y/N)：")
+		if !confirm() {
+			fmt.Println("已取消。")
+			return 0
+		}
+	}
 	res, err := store.RestoreOriginal()
 	if err != nil {
 		return exitFor(err)
 	}
 	printResult("已恢复为系统原始 hosts。", res)
+	return 0
+}
+
+// cmdUndo 撤销上一次写入（应用配置/恢复/手动保存等）。
+func cmdUndo(store *core.Store) int {
+	la, ok := store.LastApplyState()
+	if !ok {
+		fmt.Println("没有可撤销的操作。")
+		return 0
+	}
+	fmt.Printf("将撤销：%s（%s）\n", la.Actor, la.At)
+	fmt.Printf("回到快照：「%s」\n", la.SnapshotName)
+	fmt.Print("确认撤销？(y/N)：")
+	if !confirm() {
+		fmt.Println("已取消。")
+		return 0
+	}
+	res, err := store.Undo()
+	if err != nil {
+		return exitFor(err)
+	}
+	printResult("已撤销上一次操作。", res)
 	return 0
 }
 
@@ -707,8 +774,9 @@ func printHelp() {
   snapshots               列出全部快照
   rename-snapshot <旧> <新> [备注]
   del-snapshot <名>        删除快照（原始备份删不掉）
-  restore <快照名>         从快照恢复 hosts
-  restore-original        紧急恢复：还原为系统原始 hosts
+  restore <快照名> [--yes]  从快照恢复 hosts（会先让你确认行数对比）
+  restore-original [--yes] 紧急恢复：还原为系统原始 hosts
+  undo                    撤销上一次写入（可来回切换）
   profiles                列出全部配置集
   apply <配置名> [--dry-run]  一键应用配置（自动校验+自动安全快照）；--dry-run 只预览 diff
   add-profile <名> [--from 文件] [--from-current] [--note 备注]
