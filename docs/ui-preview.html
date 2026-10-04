@@ -67,13 +67,13 @@ footer{color:var(--muted);font-size:12px;padding:0 20px 30px;max-width:1060px}
   border:1px solid var(--line);border-radius:8px;padding:10px 12px;max-height:300px;overflow:auto;white-space:pre-wrap}
 </style>
 </head>
-<div style="background:#fff8e6;border-bottom:1px solid #e3c98f;color:#8a6d14;font-size:12px;padding:6px 20px">这是 Web UI 的静态预览（演示数据），真实运行时数据来自本机 hosts。请用 <code>autohostswitch web</code> 启动后访问。</div>
+<div style="background:#fff8e6;border-bottom:1px solid #e3c98f;color:#8a6d14;font-size:12px;padding:6px 20px">这是 Web UI 的静态预览（演示数据）。真实运行时请用 <code>autohostswitch web</code> 启动后访问本机页面。</div>
 <body>
 <header>
   <h1>AutoHostSwitch</h1>
-  <span class="pill" id="pill-os">…</span>
-  <span class="pill" id="pill-path">…</span>
-  <span class="pill" id="pill-perm">…</span>
+  <span class="pill" id="pill-os">Linux</span>
+  <span class="pill" id="pill-path">/etc/hosts</span>
+  <span class="pill ok" id="pill-perm">可写</span>
 </header>
 <nav id="tabs">
   <button data-tab="hosts" class="active">当前 Hosts</button>
@@ -88,10 +88,22 @@ footer{color:var(--muted);font-size:12px;padding:0 20px 30px;max-width:1060px}
   <section id="tab-hosts">
     <div class="card">
       <h2>编辑当前 hosts</h2>
-      <div class="muted" id="hosts-meta">…</div>
+      <div class="muted" id="hosts-meta">共 7 行，其中 5 条有效映射 · 当前身份可直接写入</div>
       <div class="ed-wrap" style="margin-top:10px">
-        <pre id="hl" aria-hidden="true"></pre>
-        <textarea id="ta" spellcheck="false" autocomplete="off"></textarea>
+        <pre id="hl" aria-hidden="true"><span class="tok-ip">127.0.0.1</span> <span class="tok-host">localhost</span>
+<span class="tok-ip">::1</span> <span class="tok-host">localhost</span>
+<span class="tok-ip">127.0.0.1</span> <span class="tok-host">myapp.local</span> <span class="tok-host">api.myapp.local</span>
+<span class="tok-ip">192.168.1.100</span> <span class="tok-host">nas.home</span>
+<span class="tok-cmt"># 广告屏蔽测试</span>
+<span class="tok-ip">0.0.0.0</span> <span class="tok-host">ads.example.com</span>
+ </pre>
+        <textarea id="ta" spellcheck="false" autocomplete="off">127.0.0.1 localhost
+::1 localhost
+127.0.0.1 myapp.local api.myapp.local
+192.168.1.100 nas.home
+# 广告屏蔽测试
+0.0.0.0 ads.example.com
+</textarea>
       </div>
       <div id="issues"></div>
       <div class="row">
@@ -116,7 +128,7 @@ footer{color:var(--muted);font-size:12px;padding:0 20px 30px;max-width:1060px}
     <div class="card">
       <h2>快照列表</h2>
       <div class="row">
-        <span class="muted" id="snap-usage">…</span>
+        <span class="muted" id="snap-usage">共 3 个快照，占用 1.2 KB</span>
         <button class="btn" id="btn-prune">清理旧自动快照</button>
       </div>
       <div class="muted" style="margin-bottom:8px">自动快照只保留最新 50 个（可配），手动快照永久保留，「系统原始备份」永远删不掉。</div>
@@ -197,7 +209,7 @@ footer{color:var(--muted);font-size:12px;padding:0 20px 30px;max-width:1060px}
 </main>
 <footer>
   AutoHostSwitch · 默认离线运行 · 零遥测 · 零自动更新 · 所有数据只存在本机
-  <span id="ver"></span>
+  <span id="ver"> · v0.2.0</span>
 </footer>
 
 <script>
@@ -534,25 +546,7 @@ function bind(){
   };
 }
 
-(async function init(){
-  bind();
-  $("pill-os").textContent="Linux";
-  $("pill-path").textContent="/etc/hosts";
-  const p=$("pill-perm"); p.textContent="\u53ef\u5199"; p.classList.add("ok");
-  $("ver").textContent=" \u00b7 v0.2.0";
-  const demo="127.0.0.1 localhost\n::1 localhost\n127.0.0.1 myapp.local api.myapp.local\n192.168.1.100 nas.home\n# \u5e7f\u544a\u5c4f\u853d\u6d4b\u8bd5\n0.0.0.0 ads.example.com\n";
-  $("ta").value=demo;
-  $("hosts-meta").textContent="\u5171 7 \u884c\uff0c\u5176\u4e2d 5 \u6761\u6709\u6548\u6620\u5c04 \u00b7 \u5f53\u524d\u8eab\u4efd\u53ef\u76f4\u63a5\u5199\u5165";
-  renderHL();
-  const box=$("snap-list");
-  box.innerHTML='<table><tr><th>\u540d\u5b57</th><th>\u5907\u6ce8</th><th>\u521b\u5efa\u65f6\u95f4</th><th>\u64cd\u4f5c</th></tr>'
-    +'<tr><td>\u7cfb\u7edf\u539f\u59cb\u5907\u4efd <span class="tag orig">\u539f\u59cb\u5907\u4efd</span></td><td>\u9996\u6b21\u8fd0\u884c\u65f6\u81ea\u52a8\u521b\u5efa</td><td>2026-10-04 11:20:00</td><td></td></tr>'
-    +'<tr><td>\u81ea\u52a8\u5b89\u5168\u5feb\u7167 2026-10-04 11:25:39 <span class="tag auto">\u81ea\u52a8</span></td><td>\u5199\u5165\u524d\u81ea\u52a8\u751f\u6210</td><td>2026-10-04 11:25:39</td><td></td></tr>'
-    +'<tr><td>\u4e0a\u7ebf\u524d</td><td>\u6539\u5e7f\u544a\u5c4f\u853d\u524d</td><td>2026-10-04 11:02:39</td><td></td></tr>'
-    +"</table>";
-  $("snap-usage").textContent="\u5171 3 \u4e2a\u5feb\u7167\uff0c\u5360\u7528 1.2 KB";
-  $("sub-warn").textContent="\u8b66\u544a\uff1a\u8ba2\u9605\u4f1a\u628a\u8fdc\u7a0b\u6587\u672c\u5199\u5165\u4f60\u7684 hosts\u3002\u53ea\u586b\u5199\u4f60\u5b8c\u5168\u4fe1\u4efb\u7684\u6765\u6e90\u3002";
-})();
+(function init(){})();
 </script>
 </body>
 </html>
