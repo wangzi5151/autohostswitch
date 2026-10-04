@@ -1,0 +1,558 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AutoHostSwitch</title>
+<style>
+/* 低饱和、简洁、无花哨动画 */
+:root{
+  --bg:#f2f3f5; --card:#ffffff; --ink:#2b2f36; --muted:#8a919c;
+  --line:#e2e5ea; --accent:#4a6fa5; --accent-soft:#e8eef7;
+  --ok:#3f7d4e; --warn:#a86f14; --bad:#b3402e; --radius:10px;
+}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--ink);
+  font-family:system-ui,-apple-system,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif;
+  font-size:14px;line-height:1.6}
+header{background:var(--card);border-bottom:1px solid var(--line);padding:12px 20px;
+  display:flex;align-items:center;gap:12px;flex-wrap:wrap;position:sticky;top:0;z-index:5}
+header h1{font-size:17px;margin:0;font-weight:650;letter-spacing:.5px}
+.pill{font-size:12px;border:1px solid var(--line);border-radius:20px;padding:2px 10px;color:var(--muted);background:var(--bg)}
+.pill.ok{color:var(--ok);border-color:#cfe0d3;background:#f0f6f1}
+.pill.bad{color:var(--bad);border-color:#e8c9c2;background:#faf0ee}
+nav{display:flex;gap:6px;padding:12px 20px 0;flex-wrap:wrap}
+nav button{border:1px solid var(--line);background:var(--card);border-radius:8px;
+  padding:7px 14px;font-size:13px;cursor:pointer;color:var(--ink)}
+nav button.active{background:var(--accent);border-color:var(--accent);color:#fff}
+main{padding:14px 20px 40px;max-width:1060px}
+.card{background:var(--card);border:1px solid var(--line);border-radius:var(--radius);
+  padding:16px 18px;margin-bottom:14px}
+.card h2{font-size:15px;margin:0 0 10px;font-weight:650}
+.muted{color:var(--muted);font-size:12.5px}
+.row{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin:10px 0}
+button.btn{border:1px solid var(--line);background:#fff;border-radius:8px;
+  padding:7px 14px;font-size:13px;cursor:pointer}
+button.btn:hover{border-color:var(--accent)}
+button.primary{background:var(--accent);border-color:var(--accent);color:#fff}
+button.primary:hover{background:#3d5f8f}
+button.danger{color:var(--bad);border-color:#e0b7ad}
+button.danger:hover{background:#faf0ee}
+button:disabled{opacity:.45;cursor:not-allowed}
+input[type=text],textarea,select{border:1px solid var(--line);border-radius:8px;
+  padding:7px 10px;font-size:13px;width:100%;font-family:inherit}
+input[type=text]:focus,textarea:focus{outline:2px solid var(--accent-soft);border-color:var(--accent)}
+table{width:100%;border-collapse:collapse;font-size:13px}
+th,td{text-align:left;padding:8px 6px;border-bottom:1px solid var(--line);vertical-align:top}
+th{color:var(--muted);font-weight:600;font-size:12px}
+.tag{font-size:11px;border-radius:4px;padding:1px 7px;background:var(--bg);border:1px solid var(--line);color:var(--muted)}
+.tag.auto{background:var(--accent-soft);border-color:#c9d8ec;color:var(--accent)}
+.tag.orig{background:#f0f6f1;border-color:#cfe0d3;color:var(--ok)}
+.issue{border-left:3px solid var(--bad);background:#fdf6f4;padding:6px 10px;margin:6px 0;border-radius:0 6px 6px 0;font-size:13px}
+.issue.warn{border-color:#d9a83f;background:#fdf9ef}
+.okmsg{border-left:3px solid var(--ok);background:#f2f8f3;padding:8px 12px;margin:8px 0;border-radius:0 6px 6px 0}
+.errmsg{border-left:3px solid var(--bad);background:#fdf6f4;padding:8px 12px;margin:8px 0;border-radius:0 6px 6px 0;white-space:pre-wrap}
+/* 编辑器：高亮层 + 透明 textarea 叠加 */
+.ed-wrap{position:relative;border:1px solid var(--line);border-radius:8px;overflow:hidden;background:#fbfcfd}
+.ed-wrap pre,.ed-wrap textarea{margin:0;padding:12px;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+  font-size:13px;line-height:1.7;white-space:pre;overflow:auto;tab-size:4}
+.ed-wrap pre{position:absolute;inset:0;pointer-events:none;color:transparent}
+.ed-wrap textarea{position:relative;background:transparent;color:transparent;caret-color:#2b2f36;
+  border:0;width:100%;height:340px;resize:vertical;display:block}
+.tok-ip{color:#2f5fb3}.tok-host{color:#2b7a3d}.tok-cmt{color:#9aa1ad}.tok-bad{color:#fff;background:var(--bad);border-radius:3px;padding:0 2px}
+.warnbox{border:1px solid #e3c98f;background:#fdf8ec;border-radius:8px;padding:10px 14px;font-size:13px;margin:10px 0}
+.hidden{display:none!important}
+footer{color:var(--muted);font-size:12px;padding:0 20px 30px;max-width:1060px}
+.log{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12.5px;background:#fbfcfd;
+  border:1px solid var(--line);border-radius:8px;padding:10px 12px;max-height:300px;overflow:auto;white-space:pre-wrap}
+</style>
+</head>
+<div style="background:#fff8e6;border-bottom:1px solid #e3c98f;color:#8a6d14;font-size:12px;padding:6px 20px">这是 Web UI 的静态预览（演示数据），真实运行时数据来自本机 hosts。请用 <code>autohostswitch web</code> 启动后访问。</div>
+<body>
+<header>
+  <h1>AutoHostSwitch</h1>
+  <span class="pill" id="pill-os">…</span>
+  <span class="pill" id="pill-path">…</span>
+  <span class="pill" id="pill-perm">…</span>
+</header>
+<nav id="tabs">
+  <button data-tab="hosts" class="active">当前 Hosts</button>
+  <button data-tab="snaps">快照</button>
+  <button data-tab="profs">配置集</button>
+  <button data-tab="backup">备份与恢复</button>
+  <button data-tab="log">日志</button>
+  <button data-tab="sub">订阅</button>
+</nav>
+<main>
+  <!-- 当前 hosts -->
+  <section id="tab-hosts">
+    <div class="card">
+      <h2>编辑当前 hosts</h2>
+      <div class="muted" id="hosts-meta">…</div>
+      <div class="ed-wrap" style="margin-top:10px">
+        <pre id="hl" aria-hidden="true"></pre>
+        <textarea id="ta" spellcheck="false" autocomplete="off"></textarea>
+      </div>
+      <div id="issues"></div>
+      <div class="row">
+        <button class="btn primary" id="btn-save">保存并应用</button>
+        <button class="btn" id="btn-reload">重新读取</button>
+        <button class="btn" id="btn-copy">复制提权命令</button>
+      </div>
+      <div id="save-msg"></div>
+    </div>
+  </section>
+
+  <!-- 快照 -->
+  <section id="tab-snaps" class="hidden">
+    <div class="card">
+      <h2>新建快照</h2>
+      <div class="row">
+        <input type="text" id="snap-name" placeholder="名字（可空，默认带时间戳）" style="max-width:260px">
+        <input type="text" id="snap-note" placeholder="备注，例如：改广告屏蔽前" style="max-width:340px">
+        <button class="btn primary" id="btn-snap-create">把当前 hosts 存成快照</button>
+      </div>
+    </div>
+    <div class="card">
+      <h2>快照列表</h2>
+      <div class="row">
+        <span class="muted" id="snap-usage">…</span>
+        <button class="btn" id="btn-prune">清理旧自动快照</button>
+      </div>
+      <div class="muted" style="margin-bottom:8px">自动快照只保留最新 50 个（可配），手动快照永久保留，「系统原始备份」永远删不掉。</div>
+      <div id="snap-list" class="muted">加载中…</div>
+      <div id="snap-diff" style="margin-top:10px"></div>
+    </div>
+  </section>
+
+  <!-- 配置集 -->
+  <section id="tab-profs" class="hidden">
+    <div class="card">
+      <h2>新建配置</h2>
+      <div class="row">
+        <input type="text" id="prof-name" placeholder="配置名，如：开发环境" style="max-width:220px">
+        <input type="text" id="prof-note" placeholder="备注（可空）" style="max-width:280px">
+      </div>
+      <textarea id="prof-content" rows="6" placeholder="粘贴 hosts 内容，或点下面「从当前 hosts 导入」"></textarea>
+      <div class="row">
+        <button class="btn" id="btn-prof-fromcur">从当前 hosts 导入</button>
+        <button class="btn primary" id="btn-prof-create">创建配置</button>
+      </div>
+      <div id="prof-msg"></div>
+    </div>
+    <div class="card">
+      <h2>配置列表 <span class="muted">— 点「应用」一键写入（会先预览 diff）</span></h2>
+      <div id="prof-list" class="muted">加载中…</div>
+      <div id="prof-diff" style="margin-top:10px"></div>
+    </div>
+  </section>
+
+  <!-- 备份与恢复 -->
+  <section id="tab-backup" class="hidden">
+    <div class="card">
+      <h2>导出 / 导入</h2>
+      <p class="muted">把全部快照和配置打成一个 JSON 文件，换机、多设备同步用。全程本地，不上传任何地方。</p>
+      <div class="row">
+        <button class="btn" id="btn-export">导出全部为 JSON</button>
+        <input type="file" id="file-import" accept=".json,application/json" style="max-width:280px">
+        <button class="btn" id="btn-import">导入备份文件</button>
+      </div>
+      <div id="backup-msg"></div>
+    </div>
+    <div class="card">
+      <h2 style="color:var(--bad)">紧急恢复</h2>
+      <p class="muted">把 hosts 还原为首次运行时自动备份的「系统原始备份」。改错变砖时的救命按钮，任何时候都能点。</p>
+      <div class="row">
+        <button class="btn danger" id="btn-restore-orig">恢复系统默认快照</button>
+      </div>
+      <div id="restore-msg"></div>
+    </div>
+  </section>
+
+  <!-- 日志 -->
+  <section id="tab-log" class="hidden">
+    <div class="card">
+      <h2>操作日志 <span class="muted">— 只记时间与动作，不收集设备信息</span></h2>
+      <div class="row">
+        <button class="btn" id="btn-log-reload">刷新</button>
+        <button class="btn danger" id="btn-log-clear">一键清空</button>
+      </div>
+      <div class="log" id="log-view">加载中…</div>
+    </div>
+  </section>
+
+  <!-- 订阅 -->
+  <section id="tab-sub" class="hidden">
+    <div class="card">
+      <h2>订阅本地文本 URL（可选，默认关闭）</h2>
+      <div class="warnbox" id="sub-warn">加载中…</div>
+      <div class="row">
+        <input type="text" id="sub-url" placeholder="https://你的可信来源/hosts.txt" style="max-width:420px">
+        <button class="btn" id="btn-sub-pull">手动拉取一次</button>
+      </div>
+      <div class="muted">只在你点按钮时拉取一次，不会自动轮询。拉取后先预览 + 校验，确认无误再点应用。</div>
+      <div id="sub-preview"></div>
+    </div>
+  </section>
+</main>
+<footer>
+  AutoHostSwitch · 默认离线运行 · 零遥测 · 零自动更新 · 所有数据只存在本机
+  <span id="ver"></span>
+</footer>
+
+<script>
+"use strict";
+const $=id=>document.getElementById(id);
+const esc=s=>s.replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;");
+
+async function api(path,method,body){
+  const opt={method:method||"GET",headers:{}};
+  if(body!==undefined){opt.headers["Content-Type"]="application/json";opt.body=JSON.stringify(body);}
+  const r=await fetch(path,opt);
+  const t=await r.text();
+  let j; try{j=JSON.parse(t);}catch(e){j={error:"服务器返回异常："+t.slice(0,120)};}
+  if(!r.ok) throw new Error(j.error||("请求失败 "+r.status));
+  if(j.error) throw new Error(j.error);
+  return j;
+}
+function showMsg(el,ok,text){
+  el.innerHTML='<div class="'+(ok?"okmsg":"errmsg")+'">'+esc(text)+"</div>";
+}
+function confirmIt(msg){return window.confirm(msg);}
+
+/* ---------- 状态 ---------- */
+let STATUS={};
+async function loadStatus(){
+  STATUS=await api("/api/status");
+  $("pill-os").textContent=STATUS.os;
+  $("pill-path").textContent=STATUS.hosts_path;
+  const p=$("pill-perm");
+  if(STATUS.writable){p.textContent="可写";p.classList.add("ok");}
+  else{p.textContent="只读（需要提权）";p.classList.add("bad");}
+  $("ver").textContent=" · v"+STATUS.version;
+  $("sub-warn").textContent=""; // 由订阅页单独设置
+  // 订阅警告文案写死在前端，与后端常量一致，避免多一次请求
+  $("sub-warn").textContent="警告：订阅会把远程文本写入你的 hosts。只填写你完全信任的来源（如你自己的服务器），不要填来路不明的 URL，恶意 hosts 可以劫持域名、窃取账号。本功能默认关闭，不会自动更新。";
+}
+
+/* ---------- 语法高亮 ---------- */
+function hlLine(line){
+  const t=line.trim();
+  if(t==="" ) return " ";
+  if(t.startsWith("#")) return '<span class="tok-cmt">'+esc(line)+"</span>";
+  let code=line, cmt="";
+  const hi=line.indexOf("#");
+  if(hi>=0){code=line.slice(0,hi);cmt=line.slice(hi);}
+  const parts=code.trim().split(/\s+/).filter(Boolean);
+  let out="";
+  if(parts.length===0){out=esc(code);}
+  else{
+    const ip=parts[0];
+    const ipOk=/^(\d{1,3}\.){3}\d{1,3}$/.test(ip)||ip.includes(":");
+    out+=ipOk?'<span class="tok-ip">'+esc(ip)+"</span>":'<span class="tok-bad">'+esc(ip)+"</span>";
+    for(let i=1;i<parts.length;i++){
+      const h=parts[i];
+      const hOk=/^[A-Za-z0-9]([A-Za-z0-9.\-]*[A-Za-z0-9])?$/.test(h)||/^[A-Za-z0-9]$/.test(h);
+      out+=" "+(hOk?'<span class="tok-host">'+esc(h)+"</span>":'<span class="tok-bad">'+esc(h)+"</span>");
+    }
+    out+=esc(code.slice(code.trimEnd().length)); // 行尾空格原样
+  }
+  if(cmt) out+='<span class="tok-cmt">'+esc(cmt)+"</span>";
+  return out||" ";
+}
+function renderHL(){
+  const ta=$("ta"),hl=$("hl");
+  hl.innerHTML=ta.value.split("\n").map(hlLine).join("\n");
+  hl.scrollTop=ta.scrollTop; hl.scrollLeft=ta.scrollLeft;
+}
+let validTimer=null;
+async function liveValidate(){
+  const v=$("ta").value;
+  try{
+    const r=await api("/api/validate","POST",{content:v});
+    const box=$("issues"); box.innerHTML="";
+    if(!r.issues||r.issues.length===0){
+      box.innerHTML='<div class="okmsg">校验通过，可以保存。</div>';return;
+    }
+    for(const it of r.issues){
+      const d=document.createElement("div");
+      d.className="issue"+(it.Warn?" warn":"");
+      d.textContent=(it.Warn?"⚠ 警告":"✘ 错误")+(it.Line?(" 第 "+it.Line+" 行："):"：")+it.Msg;
+      box.appendChild(d);
+    }
+  }catch(e){/* 校验失败不打扰输入 */}
+}
+async function loadHosts(){
+  const r=await api("/api/hosts");
+  $("ta").value=r.path;
+  window.hostsHash=r.content_hash||"";
+  $("hosts-meta").textContent="共 "+r.total_lines+" 行，其中 "+r.active_lines+" 条有效映射 · "+(r.writable?"当前身份可直接写入":"当前身份不可写，保存前请先提权");
+  renderHL(); liveValidate();
+}
+function stepsText(r){
+  // 把后端返回的执行阶段拼成一行：已校验 → 已备份 → 已写入 → 已验证
+  return (r.steps&&r.steps.length)?("（"+r.steps.join(" → ")+"）"):"";
+}
+
+function fmtBytes(b){
+  if(b<1024)return b+" B";
+  const u=["KB","MB","GB"];let i=-1;
+  do{b/=1024;i++;}while(b>=1024&&i<u.length-1);
+  return b.toFixed(1)+" "+u[i];
+}
+function showDiff(el,title,d){
+  if(d.added===0&&d.removed===0){el.innerHTML='<div class="okmsg">'+esc(title)+"：两边完全一样。</div>";return;}
+  let h='<div class="card" style="margin:0"><h2>'+esc(title)+"（+"+d.added+" / -"+d.removed+"）</h2>";
+  h+='<div class="log" style="max-height:260px">';
+  for(const l of d.lines.slice(0,200)){
+    const cls=l.op==="+"?"color:var(--ok)":(l.op==="-"?"color:var(--bad)":"color:var(--muted)");
+    h+='<div style="'+cls+'">'+esc(l.op+" "+l.text)+"</div>";
+  }
+  if(d.lines.length>200)h+='<div class="muted">…（只显示前 200 行）</div>';
+  el.innerHTML=h+"</div></div>";
+}
+async function loadSnapUsage(){
+  try{
+    const u=await api("/api/snapshots/usage");
+    $("snap-usage").textContent="共 "+u.count+" 个快照，占用 "+fmtBytes(u.bytes);
+  }catch(e){$("snap-usage").textContent="";}
+}
+async function loadSnaps(){
+  const list=await api("/api/snapshots");
+  loadSnapUsage().catch(()=>{});
+  const box=$("snap-list");
+  if(list.length===0){box.innerHTML='<span class="muted">还没有快照，先新建一个吧。</span>';return;}
+  let h='<table><tr><th>名字</th><th>备注</th><th>创建时间</th><th>操作</th></tr>';
+  for(const s of list){
+    h+="<tr><td>"+esc(s.name)+
+      (s.is_original?' <span class="tag orig">原始备份</span>':"")+
+      (s.auto?' <span class="tag auto">自动</span>':"")+"</td><td>"+
+      esc(s.note||"—")+"</td><td>"+esc(s.created_at)+"</td><td>"+
+      '<button class="btn" data-act="restore" data-id="'+s.id+'">恢复</button> '+
+      '<button class="btn" data-act="diff" data-id="'+s.id+'">对比当前</button> '+
+      '<button class="btn" data-act="rename" data-id="'+s.id+'">重命名</button> '+
+      '<button class="btn" data-act="dl" data-id="'+s.id+'">导出</button> '+
+      (s.is_original?"":'<button class="btn danger" data-act="del" data-id="'+s.id+'">删除</button>')+
+      "</td></tr>";
+  }
+  box.innerHTML=h+"</table>";
+  box.querySelectorAll("button").forEach(b=>b.onclick=()=>snapAct(b.dataset.act,b.dataset.id));
+}
+async function snapAct(act,id){
+  try{
+    if(act==="restore"){
+      if(!confirmIt("确定把 hosts 恢复到这个快照吗？恢复前会自动再存一份当前状态。"))return;
+      const r=await api("/api/snapshots/"+id+"/restore","POST");
+      alert("已恢复。"+stepsText(r)+(r.warnings?"\n"+r.warnings:"")); loadHosts(); loadSnaps();
+    }else if(act==="rename"){
+      const name=prompt("新名字："); if(!name)return;
+      const note=prompt("备注（可空）：")||"";
+      await api("/api/snapshots/"+id,"PUT",{name:name,note:note}); loadSnaps();
+    }else if(act==="del"){
+      if(!confirmIt("确定删除这个快照吗？"))return;
+      await api("/api/snapshots/"+id,"DELETE"); loadSnaps();
+    }else if(act==="dl"){
+      window.location="/api/snapshots/"+id;
+    }else if(act==="diff"){
+      try{
+        const d=await api("/api/diff?from=current&to="+encodeURIComponent("snapshot:"+id));
+        showDiff($("snap-diff"),"当前 hosts vs 快照",d);
+      }catch(e){alert("失败："+e.message);}
+    }
+  }catch(e){alert("失败："+e.message);}
+}
+
+/* ---------- 配置集 ---------- */
+async function loadProfs(){
+  const list=await api("/api/profiles");
+  const box=$("prof-list");
+  if(list.length===0){box.innerHTML='<span class="muted">还没有配置，新建一套吧（比如“开发环境”“屏蔽广告”）。</span>';return;}
+  let h='<table><tr><th>名字</th><th>备注</th><th>更新时间</th><th>操作</th></tr>';
+  for(const p of list){
+    h+="<tr><td>"+esc(p.name)+"</td><td>"+esc(p.note||"—")+"</td><td>"+esc(p.updated_at)+"</td><td>"+
+      '<button class="btn primary" data-act="apply" data-id="'+p.id+'">应用</button> '+
+      '<button class="btn" data-act="diff" data-id="'+p.id+'">对比当前</button> '+
+      '<button class="btn" data-act="edit" data-id="'+p.id+'">查看/编辑</button> '+
+      '<button class="btn" data-act="rename" data-id="'+p.id+'">重命名</button> '+
+      '<button class="btn danger" data-act="del" data-id="'+p.id+'">删除</button></td></tr>";
+  }
+  box.innerHTML=h+"</table>";
+  box.querySelectorAll("button").forEach(b=>b.onclick=()=>profAct(b.dataset.act,b.dataset.id));
+}
+async function profAct(act,id){
+  try{
+    if(act==="apply"){
+      // 先预览 diff，让用户看到底哪些行会被增删（评审第 61-64 条）
+      try{
+        const d=await api("/api/diff?from=current&to="+encodeURIComponent("profile:"+id));
+        const preview=d.lines.slice(0,30).map(l=>l.op+" "+l.text).join("\n");
+        const more=d.lines.length>30?("\n…（共 "+d.lines.length+" 行，只显示前 30 行）"):"";
+        if(!confirmIt("应用后将：+"+d.added+" 行 / -"+d.removed+" 行\n\n"+preview+more+"\n\n确定应用吗？应用前会自动备份当前 hosts。"))return;
+      }catch(e){ if(!confirmIt("diff 预览失败（"+e.message+"），仍要应用吗？"))return; }
+      const r=await api("/api/profiles/"+id+"/apply","POST");
+      alert("已应用。"+stepsText(r)+(r.warnings?"\n"+r.warnings:"")); loadHosts();
+    }else if(act==="edit"){
+      const r=await api("/api/profiles/"+id);
+      const c=prompt("编辑配置内容（完整 hosts 文本）：",r.content);
+      if(c===null)return;
+      await api("/api/profiles/"+id,"PUT",{content:c});
+      alert("已保存。"); loadProfs();
+    }else if(act==="rename"){
+      const name=prompt("新名字："); if(!name)return;
+      await api("/api/profiles/"+id,"PUT",{name:name}); loadProfs();
+    }else if(act==="del"){
+      if(!confirmIt("确定删除这套配置吗？"))return;
+      await api("/api/profiles/"+id,"DELETE"); loadProfs();
+    }else if(act==="diff"){
+      try{
+        const d=await api("/api/diff?from=current&to="+encodeURIComponent("profile:"+id));
+        showDiff($("prof-diff"),"当前 hosts vs 配置",d);
+      }catch(e){alert("失败："+e.message);}
+    }
+  }catch(e){alert("失败："+e.message);}
+}
+
+/* ---------- 备份 / 日志 / 订阅 ---------- */
+async function loadLog(){
+  try{
+    const lines=await api("/api/log");
+    $("log-view").textContent=lines.length?lines.join("\n"):"（暂无日志）";
+  }catch(e){$("log-view").textContent="读取失败："+e.message;}
+}
+
+/* ---------- 事件绑定 ---------- */
+function bind(){
+  document.querySelectorAll("#tabs button").forEach(b=>{
+    b.onclick=()=>{
+      document.querySelectorAll("#tabs button").forEach(x=>x.classList.remove("active"));
+      b.classList.add("active");
+      ["hosts","snaps","profs","backup","log","sub"].forEach(t=>{
+        $("tab-"+t).classList.toggle("hidden",t!==b.dataset.tab);
+      });
+      if(b.dataset.tab==="log")loadLog();
+    };
+  });
+  const ta=$("ta");
+  ta.addEventListener("input",()=>{renderHL();clearTimeout(validTimer);validTimer=setTimeout(liveValidate,400);});
+  ta.addEventListener("scroll",()=>{const hl=$("hl");hl.scrollTop=ta.scrollTop;hl.scrollLeft=ta.scrollLeft;});
+  $("btn-reload").onclick=()=>loadHosts().catch(e=>showMsg($("save-msg"),false,e.message));
+  $("btn-copy").onclick=async()=>{
+    try{
+      const s=await api("/api/status");
+      await navigator.clipboard.writeText(s.elevate_hint);
+      showMsg($("save-msg"),true,"提权命令已复制，去管理员终端粘贴执行即可。");
+    }catch(e){showMsg($("save-msg"),false,"复制失败，请手动查看："+e.message);}
+  };
+  $("btn-save").onclick=async()=>{
+    try{
+      const r=await api("/api/hosts","POST",{content:ta.value,expected_hash:window.hostsHash||""});
+      showMsg($("save-msg"),true,("保存成功，hosts 已更新。"+stepsText(r)+(r.warnings?"\n"+r.warnings:"")));
+      loadHosts(); loadStatus();
+    }catch(e){
+      // 409 = 并发冲突：hosts 在你编辑期间被外部改过
+      showMsg($("save-msg"),false,e.message+"（如提示被外部修改，请点“重新读取”后再操作）");
+    }
+  };
+  $("btn-prune").onclick=async()=>{
+    if(!confirmIt("清理超出保留上限的旧自动快照？手动快照和原始备份不受影响。"))return;
+    try{
+      const r=await api("/api/snapshots/prune","POST");
+      alert(r.deleted===0?"没有可清理的旧自动快照。":("已清理 "+r.deleted+" 个，释放 "+fmtBytes(r.freed_bytes)+"。"));
+      loadSnaps();
+    }catch(e){alert("失败："+e.message);}
+  };
+  $("btn-snap-create").onclick=async()=>{
+    try{
+      await api("/api/snapshots","POST",{name:$("snap-name").value.trim(),note:$("snap-note").value.trim()});
+      $("snap-name").value="";$("snap-note").value="";loadSnaps();loadStatus();
+    }catch(e){alert("失败："+e.message);}
+  };
+  $("btn-prof-fromcur").onclick=async()=>{
+    try{const r=await api("/api/hosts");$("prof-content").value=r.path;}
+    catch(e){alert("失败："+e.message);}
+  };
+  $("btn-prof-create").onclick=async()=>{
+    const name=$("prof-name").value.trim();
+    if(!name){showMsg($("prof-msg"),false,"配置名不能为空。");return;}
+    try{
+      await api("/api/profiles","POST",{name:name,note:$("prof-note").value.trim(),content:$("prof-content").value});
+      $("prof-name").value="";$("prof-note").value="";$("prof-content").value="";
+      showMsg($("prof-msg"),true,"配置「"+name+"」已创建。");loadProfs();loadStatus();
+    }catch(e){showMsg($("prof-msg"),false,e.message);}
+  };
+  $("btn-export").onclick=()=>{window.location="/api/export";};
+  $("btn-import").onclick=async()=>{
+    const f=$("file-import").files[0];
+    if(!f){showMsg($("backup-msg"),false,"请先选择备份 JSON 文件。");return;}
+    try{
+      const r=await fetch("/api/import",{method:"POST",body:f});
+      const j=await r.json();
+      if(!r.ok)throw new Error(j.error||"导入失败");
+      showMsg($("backup-msg"),true,"导入成功："+j.snapshots+" 个快照，"+j.profiles+" 个配置。");
+      loadSnaps();loadProfs();loadStatus();
+    }catch(e){showMsg($("backup-msg"),false,e.message);}
+  };
+  $("btn-restore-orig").onclick=async()=>{
+    if(!confirmIt("确定恢复为系统原始 hosts 吗？当前内容会先自动备份，可反悔。"))return;
+    try{
+      const r=await api("/api/restore-original","POST");
+      showMsg($("restore-msg"),true,r.warnings?("已恢复为系统原始 hosts。\n"+r.warnings):"已恢复为系统原始 hosts。");
+      loadHosts();
+    }catch(e){showMsg($("restore-msg"),false,e.message);}
+  };
+  $("btn-log-reload").onclick=loadLog;
+  $("btn-log-clear").onclick=async()=>{
+    if(!confirmIt("确定清空全部操作日志吗？"))return;
+    try{await api("/api/log/clear","POST");loadLog();}catch(e){alert("失败："+e.message);}
+  };
+  $("btn-sub-pull").onclick=async()=>{
+    const url=$("sub-url").value.trim();
+    if(!url){alert("请先填写订阅 URL。");return;}
+    if(!confirmIt("再次确认：只从你信任的来源拉取。继续吗？"))return;
+    const box=$("sub-preview");box.innerHTML='<p class="muted">拉取中…</p>';
+    try{
+      const r=await api("/api/subscribe","POST",{url:url});
+      let h='<div class="card" style="margin-top:10px"><h2>拉取预览</h2>';
+      if(r.has_error){
+        h+='<div class="errmsg">校验没通过，不能应用：\n';
+        for(const it of r.issues){if(!it.Warn)h+="第 "+it.Line+" 行："+esc(it.Msg)+"\n";}
+        h+="</div>";
+      }else{
+        h+='<div class="okmsg">校验通过（'+(r.issues?r.issues.length:0)+' 条警告），确认后可应用。</div>';
+        h+='<div class="row"><button class="btn primary" id="btn-sub-apply">应用这份订阅到 hosts</button></div>';
+      }
+      h+='<pre class="log" style="max-height:220px">'+esc(r.content.slice(0,4000))+"</pre></div>";
+      box.innerHTML=h;
+      const ab=$("btn-sub-apply");
+      if(ab)ab.onclick=async()=>{
+        try{
+          const rr=await api("/api/hosts","POST",{content:r.content});
+          alert(rr.warnings?("已应用。\n"+rr.warnings):"订阅已应用到 hosts。");loadHosts();
+        }catch(e){alert("失败："+e.message);}
+      };
+    }catch(e){box.innerHTML='<div class="errmsg">'+esc(e.message)+"</div>";}
+  };
+}
+
+(async function init(){
+  bind();
+  $("pill-os").textContent="Linux";
+  $("pill-path").textContent="/etc/hosts";
+  const p=$("pill-perm"); p.textContent="\u53ef\u5199"; p.classList.add("ok");
+  $("ver").textContent=" \u00b7 v0.2.0";
+  const demo="127.0.0.1 localhost\n::1 localhost\n127.0.0.1 myapp.local api.myapp.local\n192.168.1.100 nas.home\n# \u5e7f\u544a\u5c4f\u853d\u6d4b\u8bd5\n0.0.0.0 ads.example.com\n";
+  $("ta").value=demo;
+  $("hosts-meta").textContent="\u5171 7 \u884c\uff0c\u5176\u4e2d 5 \u6761\u6709\u6548\u6620\u5c04 \u00b7 \u5f53\u524d\u8eab\u4efd\u53ef\u76f4\u63a5\u5199\u5165";
+  renderHL();
+  const box=$("snap-list");
+  box.innerHTML='<table><tr><th>\u540d\u5b57</th><th>\u5907\u6ce8</th><th>\u521b\u5efa\u65f6\u95f4</th><th>\u64cd\u4f5c</th></tr>'
+    +'<tr><td>\u7cfb\u7edf\u539f\u59cb\u5907\u4efd <span class="tag orig">\u539f\u59cb\u5907\u4efd</span></td><td>\u9996\u6b21\u8fd0\u884c\u65f6\u81ea\u52a8\u521b\u5efa</td><td>2026-10-04 11:20:00</td><td></td></tr>'
+    +'<tr><td>\u81ea\u52a8\u5b89\u5168\u5feb\u7167 2026-10-04 11:25:39 <span class="tag auto">\u81ea\u52a8</span></td><td>\u5199\u5165\u524d\u81ea\u52a8\u751f\u6210</td><td>2026-10-04 11:25:39</td><td></td></tr>'
+    +'<tr><td>\u4e0a\u7ebf\u524d</td><td>\u6539\u5e7f\u544a\u5c4f\u853d\u524d</td><td>2026-10-04 11:02:39</td><td></td></tr>'
+    +"</table>";
+  $("snap-usage").textContent="\u5171 3 \u4e2a\u5feb\u7167\uff0c\u5360\u7528 1.2 KB";
+  $("sub-warn").textContent="\u8b66\u544a\uff1a\u8ba2\u9605\u4f1a\u628a\u8fdc\u7a0b\u6587\u672c\u5199\u5165\u4f60\u7684 hosts\u3002\u53ea\u586b\u5199\u4f60\u5b8c\u5168\u4fe1\u4efb\u7684\u6765\u6e90\u3002";
+})();
+</script>
+</body>
+</html>
