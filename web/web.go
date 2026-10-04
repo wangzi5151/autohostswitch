@@ -8,12 +8,16 @@
 package web
 
 import (
+	"context"
 	_ "embed"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
+	"os"
 	"strings"
+	"time"
 
 	"github.com/wangzi5151/autohostswitch/core"
 	"github.com/wangzi5151/autohostswitch/platform"
@@ -34,6 +38,8 @@ type Store2 = core.Store
 
 // NewServer 创建服务实例。
 func NewServer(store *core.Store, version string) *Server {
+	// Web 发起的写入记操作日志时来源标为 Web
+	store.Source = "Web"
 	return &Server{Store: store, Version: version}
 }
 
@@ -68,6 +74,7 @@ func (sv *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /api/restore-original", sv.handleRestoreOriginal)
 
 	mux.HandleFunc("GET /api/log", sv.handleGetLog)
+	mux.HandleFunc("GET /api/log/entries", sv.handleGetLogEntries)
 	mux.HandleFunc("POST /api/log/clear", sv.handleClearLog)
 
 	mux.HandleFunc("POST /api/subscribe", sv.handleSubscribe)
@@ -77,7 +84,29 @@ func (sv *Server) Handler() http.Handler {
 
 	mux.HandleFunc("GET /api/undo-state", sv.handleUndoState)
 	mux.HandleFunc("POST /api/undo", sv.handleUndo)
-	return csrfGuard(mux)
+	// 明确拒绝 CORS 预检：本工具不提供跨站 API，不设任何 CORS 头
+	mux.HandleFunc("OPTIONS /api/", func(w http.ResponseWriter, r *http.Request) {
+		writeErr(w, 405, "不允许跨站调用本机 API。")
+	})
+	return hostGuard(csrfGuard(mux))
+}
+
+// hostGuard：防 DNS rebinding。攻击者可让浏览器把 attacker.com 解析到
+// 127.0.0.1，此时 Origin 检查可能被绕过（某些场景），但 Host 头一定是
+// attacker.com —— 直接拒绝非本地 Host。
+func hostGuard(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		h := r.Host
+		if i := strings.LastIndex(h, ":"); i >= 0 {
+			h = h[:i]
+		}
+		h = strings.Trim(h, "[]")
+		if h != "" && h != "127.0.0.1" && h != "localhost" && h != "::1" {
+			writeErr(w, 403, "已拦截：Host 头不是本机地址（疑似 DNS rebinding 攻击）。")
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
 }
 
 // csrfGuard：localhost 工具的 CSRF 防线。
@@ -129,14 +158,44 @@ func isLocalOrigin(origin string) bool {
 
 // ListenAndServe 在 addr（默认 127.0.0.1:8080）上启动服务。
 func (sv *Server) ListenAndServe(addr string) error {
+	srv, err := sv.newHTTPServer(addr)
+	if err != nil {
+		return err
+	}
+	return srv.ListenAndServe()
+}
+
+// newHTTPServer 构造 *http.Server（供优雅关闭复用）。
+func (sv *Server) newHTTPServer(addr string) (*http.Server, error) {
 	if addr == "" {
 		addr = "127.0.0.1:8080"
 	}
 	// 安全护栏：拒绝绑定到非本地地址，防止用户误配对外暴露
 	if !isLoopbackAddr(addr) {
-		return fmt.Errorf("为安全起见，Web UI 只允许绑定本地地址（如 127.0.0.1:8080），拒绝：%s", addr)
+		return nil, fmt.Errorf("为安全起见，Web UI 只允许绑定本地地址（如 127.0.0.1:8080），拒绝：%s", addr)
 	}
-	return http.ListenAndServe(addr, sv.Handler())
+	return &http.Server{Addr: addr, Handler: sv.Handler()}, nil
+}
+
+// ServeGraceful 启动服务并在收到 SIGINT/SIGTERM 时优雅关闭：
+// 先停掉监听（不再接受新连接），等手头请求做完再退出，
+// 进程退出后不存在残留监听。
+func (sv *Server) ServeGraceful(addr string, sigCh <-chan os.Signal) error {
+	srv, err := sv.newHTTPServer(addr)
+	if err != nil {
+		return err
+	}
+	go func() {
+		<-sigCh
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = srv.Shutdown(ctx)
+	}()
+	err = srv.ListenAndServe()
+	if errors.Is(err, http.ErrServerClosed) {
+		return nil
+	}
+	return err
 }
 
 func isLoopbackAddr(addr string) bool {
@@ -175,10 +234,37 @@ func readJSON(r *http.Request, v any) error {
 	if err != nil {
 		return fmt.Errorf("读取请求失败：%w", err)
 	}
-	if err := json.Unmarshal(body, v); err != nil {
-		return fmt.Errorf("请求不是合法 JSON：%w", err)
+	dec := json.NewDecoder(strings.NewReader(string(body)))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(v); err != nil {
+		return fmt.Errorf("请求 JSON 不合法或含未知字段：%w", err)
 	}
 	return nil
+}
+
+// validID 纵深防御：快照/配置 ID 只允许安全字符。
+// 正常 ID 由 newID() 生成（时间+hex），不可能含危险字符；
+// 这里防的是“索引文件被手改/损坏后塞入 ../../ 之类”。
+func validID(id string) bool {
+	if id == "" || len(id) > 128 {
+		return false
+	}
+	for _, r := range id {
+		if !(r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' || r == '-' || r == '_' || r == '.') {
+			return false
+		}
+	}
+	return true
+}
+
+// pathID 提取并校验路径中的 id 参数，不合法直接写 400。
+func pathID(w http.ResponseWriter, r *http.Request) (string, bool) {
+	id := r.PathValue("id")
+	if !validID(id) {
+		writeErr(w, 400, "非法的 id 参数。")
+		return "", false
+	}
+	return id, true
 }
 
 // ---------- 页面与状态 ----------
@@ -197,6 +283,22 @@ func (sv *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 		hint = platform.ElevateHint("autohostswitch")
 		_ = werr
 	}
+	// 当前 hosts 状态面板数据
+	var size int64
+	var mtime string
+	var total, active, domains int
+	if fi, err := os.Stat(sv.Store.HostsPath); err == nil {
+		size = fi.Size()
+		mtime = fi.ModTime().Format("2006-01-02 15:04:05")
+	}
+	if content, err := sv.Store.ReadCurrentHosts(); err == nil {
+		total, active = core.CountStats(content)
+		domains = core.CountDomains(content)
+	}
+	lastActor, lastAt := "", ""
+	if la, ok := sv.Store.LastApplyState(); ok {
+		lastActor, lastAt = la.Actor, la.At
+	}
 	writeJSON(w, 200, map[string]any{
 		"version":      sv.Version,
 		"os":           platform.OSName(),
@@ -208,6 +310,15 @@ func (sv *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 		"snapshots":    len(snaps),
 		"profiles":     len(profs),
 		"has_original": sv.Store.OriginalSnapshotID() != "",
+		// —— 状态面板 ——
+		"file_size":         size,
+		"modified_at":       mtime,
+		"total_lines":       total,
+		"active_lines":      active,
+		"domains":           domains,
+		"last_apply_actor":  lastActor,
+		"last_apply_at":     lastAt,
+		"external_modified": sv.Store.ExternalModified(),
 	})
 }
 
@@ -305,7 +416,10 @@ func (sv *Server) handleCreateSnapshot(w http.ResponseWriter, r *http.Request) {
 }
 
 func (sv *Server) handleDownloadSnapshot(w http.ResponseWriter, r *http.Request) {
-	id := r.PathValue("id")
+	id, ok := pathID(w, r)
+	if !ok {
+		return
+	}
 	snap, err := sv.Store.GetSnapshot(id)
 	if err != nil {
 		writeErr(w, 404, err.Error())
@@ -322,7 +436,10 @@ func (sv *Server) handleDownloadSnapshot(w http.ResponseWriter, r *http.Request)
 }
 
 func (sv *Server) handleRenameSnapshot(w http.ResponseWriter, r *http.Request) {
-	id := r.PathValue("id")
+	id, ok := pathID(w, r)
+	if !ok {
+		return
+	}
 	var req struct {
 		Name string `json:"name"`
 		Note string `json:"note"`
@@ -339,7 +456,11 @@ func (sv *Server) handleRenameSnapshot(w http.ResponseWriter, r *http.Request) {
 }
 
 func (sv *Server) handleDeleteSnapshot(w http.ResponseWriter, r *http.Request) {
-	if err := sv.Store.DeleteSnapshot(r.PathValue("id")); err != nil {
+	id, ok := pathID(w, r)
+	if !ok {
+		return
+	}
+	if err := sv.Store.DeleteSnapshot(id); err != nil {
 		writeErr(w, 400, err.Error())
 		return
 	}
@@ -347,7 +468,11 @@ func (sv *Server) handleDeleteSnapshot(w http.ResponseWriter, r *http.Request) {
 }
 
 func (sv *Server) handleRestoreSnapshot(w http.ResponseWriter, r *http.Request) {
-	res, err := sv.Store.RestoreSnapshot(r.PathValue("id"))
+	id, ok := pathID(w, r)
+	if !ok {
+		return
+	}
+	res, err := sv.Store.RestoreSnapshot(id)
 	if err != nil {
 		writeErr(w, errCode(err), err.Error())
 		return
@@ -385,7 +510,11 @@ func (sv *Server) handleCreateProfile(w http.ResponseWriter, r *http.Request) {
 }
 
 func (sv *Server) handleGetProfile(w http.ResponseWriter, r *http.Request) {
-	p, err := sv.Store.GetProfile(r.PathValue("id"))
+	id, ok := pathID(w, r)
+	if !ok {
+		return
+	}
+	p, err := sv.Store.GetProfile(id)
 	if err != nil {
 		writeErr(w, 404, err.Error())
 		return
@@ -407,7 +536,10 @@ func (sv *Server) handleUpdateProfile(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, err.Error())
 		return
 	}
-	id := r.PathValue("id")
+	id, ok := pathID(w, r)
+	if !ok {
+		return
+	}
 	if req.Name != "" {
 		if err := sv.Store.RenameProfile(id, req.Name); err != nil {
 			writeErr(w, 400, err.Error())
@@ -424,7 +556,11 @@ func (sv *Server) handleUpdateProfile(w http.ResponseWriter, r *http.Request) {
 }
 
 func (sv *Server) handleDeleteProfile(w http.ResponseWriter, r *http.Request) {
-	if err := sv.Store.DeleteProfile(r.PathValue("id")); err != nil {
+	id, ok := pathID(w, r)
+	if !ok {
+		return
+	}
+	if err := sv.Store.DeleteProfile(id); err != nil {
 		writeErr(w, 400, err.Error())
 		return
 	}
@@ -432,7 +568,11 @@ func (sv *Server) handleDeleteProfile(w http.ResponseWriter, r *http.Request) {
 }
 
 func (sv *Server) handleApplyProfile(w http.ResponseWriter, r *http.Request) {
-	res, err := sv.Store.ApplyProfile(r.PathValue("id"))
+	id, ok := pathID(w, r)
+	if !ok {
+		return
+	}
+	res, err := sv.Store.ApplyProfile(id)
 	if err != nil {
 		writeErr(w, errCode(err), err.Error())
 		return
@@ -486,6 +626,23 @@ func (sv *Server) handleGetLog(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, lines)
 }
 
+// handleGetLogEntries 返回结构化操作历史（时间/来源/操作/结果/快照）。
+func (sv *Server) handleGetLogEntries(w http.ResponseWriter, r *http.Request) {
+	entries, err := sv.Store.ReadLogEntries()
+	if err != nil {
+		writeErr(w, 500, err.Error())
+		return
+	}
+	out := make([]map[string]string, 0, len(entries))
+	for _, e := range entries {
+		out = append(out, map[string]string{
+			"at": e.At, "source": e.Source, "action": e.Action,
+			"result": e.Result, "snapshot": e.Snapshot,
+		})
+	}
+	writeJSON(w, 200, out)
+}
+
 func (sv *Server) handleClearLog(w http.ResponseWriter, r *http.Request) {
 	if err := sv.Store.ClearLog(); err != nil {
 		writeErr(w, 500, err.Error())
@@ -529,13 +686,16 @@ func (sv *Server) handleDiff(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, err.Error())
 		return
 	}
-	added, removed := core.DiffSummary(d)
+	st := core.DiffSummary(d)
 	out := make([]map[string]any, 0, len(d))
 	for _, l := range d {
-		out = append(out, map[string]any{"op": string(l.Op), "text": l.Text})
+		out = append(out, map[string]any{
+			"op": string(l.Op), "text": l.Text,
+			"old_line": l.OldLine, "new_line": l.NewLine,
+		})
 	}
 	writeJSON(w, 200, map[string]any{
-		"lines": out, "added": added, "removed": removed,
+		"lines": out, "added": st.Added, "removed": st.Removed, "modified": st.Modified,
 	})
 }
 

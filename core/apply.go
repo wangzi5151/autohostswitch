@@ -85,7 +85,18 @@ func (s *Store) ApplyHosts(content, actor string) (*ApplyResult, error) {
 // 写入临界区（哈希复核 → 安全快照 → 原子写入）持有进程间写入锁，
 // 防止同一台机器上的另一个 AutoHostSwitch（CLI/Web）同时写入。
 // 外部编辑器不走本锁，那种情况仍由哈希比对兜底。
+// ApplyHostsGuarded 是写入 hosts 的统一出口：成功记“成功+安全快照名”，
+// 失败记“失败：原因”。所有写入（CLI/Web、恢复、撤销）都经过这里，
+// 所以操作历史天然完整。
 func (s *Store) ApplyHostsGuarded(content, actor, expectHash string) (*ApplyResult, error) {
+	res, err := s.applyHostsGuarded(content, actor, expectHash)
+	if err != nil {
+		s.appendLogEntry(s.Source, actor, "失败："+shortErr(err), "")
+	}
+	return res, err
+}
+
+func (s *Store) applyHostsGuarded(content, actor, expectHash string) (*ApplyResult, error) {
 	res := &ApplyResult{}
 	issues := ValidateHosts(content)
 	if HasError(issues) {
@@ -134,13 +145,29 @@ func (s *Store) ApplyHostsGuarded(content, actor, expectHash string) (*ApplyResu
 	}
 	res.Steps = append(res.Steps, "已原子写入", "已验证落盘内容一致")
 
-	s.appendLog(actor)
+	snapName := ""
+	if safety != nil {
+		snapName = safety.Name
+	}
+	s.appendLogEntry(s.Source, actor, "成功", snapName)
+	// 记录写入后的哈希，供“外部修改检测”用
+	s.meta.LastKnownHash = HashHosts(content)
+	_ = s.saveMeta()
 	if w := WarningsText(issues); w != "" {
 		res.Warnings = w
 	}
 	// 记录“上一次写入”，供“撤销”使用（快照 ID + 操作描述）
 	s.recordLastApply(safety, actor)
 	return res, nil
+}
+
+// shortErr 把错误信息截短，适合记日志（一行）。
+func shortErr(err error) string {
+	msg := strings.ReplaceAll(err.Error(), "\n", " ")
+	if len([]rune(msg)) > 120 {
+		msg = string([]rune(msg)[:120]) + "…"
+	}
+	return msg
 }
 
 // atomicWrite 把 content 原子地写入 hosts 文件：

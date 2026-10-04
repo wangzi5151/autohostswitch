@@ -101,15 +101,22 @@ autohostswitch serve                        # Web UI -> http://127.0.0.1:8080
   拉取后先预览 + 校验，必须二次确认才会写入。默认关闭，永不自动轮询。
 - 自查方法见 [SECURITY.md](SECURITY.md)（三步审计指引）。
 
-## 安全模型（为什么可以信任）
+## 为什么我可以相信这个程序？
 
 1. **只做 hosts 这一件事**：核心链路是 编辑 → 校验 → 配置集 → 快照 → Diff → 安全写入 → 恢复。
-   与 DNS、Ping、代理、VPN 无关的功能不做（详见 Issue 模板里的范围确认）。
-2. **写操作四重保护**：语法校验 → 并发哈希检查 → 自动安全快照 → 原子写入 + 落盘验证。
-3. **Web UI 纵深防御**：只绑 127.0.0.1（拒绝非本地地址）；写接口校验 Origin/Referer 防 CSRF；
-   不设置 CORS 头；请求体限大小；所有副作用操作均为 POST/PUT/DELETE。
-4. **可审计**：零第三方依赖（`go.mod` 无外部模块），hosts 相关逻辑集中在 `core/`，
-   重要位置均有中文注释；CI 每次跑 `gofmt`/`go vet`/全量测试/全平台编译。
+   与 DNS、Ping、代理、VPN 无关的功能不做。它能修改的**只有系统 hosts 这一个文件**（详见 SECURITY.md 的权限边界）。
+2. **写操作不可能搞坏 hosts**：语法校验 → 并发哈希检查 → 进程间文件锁 → 自动安全快照 →
+   原子写入（临时文件+fsync+rename）→ 读回验证。任何一步失败，原文件一个字节都不动；
+   即使写入瞬间断电，也只会是完整旧文件或完整新文件。每次写入前自动快照 + 一键 Undo。
+3. **恶意网页调不动它**：Web UI 只绑 127.0.0.1；Host 头校验防 DNS rebinding；
+   写接口校验 Origin/Referer 防 CSRF；不设置 CORS 头；请求体限大小；严格 JSON（未知字段拒绝）；
+   路径参数白名单（防穿越）；优雅关闭不留残留监听。
+4. **二进制可验证来源**：每个 Release 附 SHA256SUMS + GitHub Artifact Attestation（Sigstore 签名）：
+   `gh attestation verify autohostswitch-linux-amd64 --repo wangzi5151/autohostswitch`
+5. **可审计**：零第三方依赖（`go.mod` 无外部模块），hosts 相关逻辑集中在 `core/`，
+   重要位置均有中文注释；CI 每次跑 `gofmt`/`go vet`/全量测试/`govulncheck`/全平台编译。
+6. **操作全程可追溯**：结构化操作历史（时间/来源 CLI·Web/操作/成功失败/关联快照），
+   状态面板实时显示文件大小、行数、域名数，并能检测 hosts 是否被本工具之外的程序改过。
 
 ## Windows 管理员注意事项
 

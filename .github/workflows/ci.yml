@@ -5,6 +5,10 @@ on:
     branches: [main]
   pull_request:
 
+# 最小权限：CI 只需要读代码
+permissions:
+  contents: read
+
 jobs:
   test:
     strategy:
@@ -26,5 +30,9 @@ jobs:
         run: go vet ./...
       - name: 单元测试
         run: go test -count=1 ./...
+      - name: 漏洞扫描 govulncheck
+        run: |
+          go install golang.org/x/vuln/cmd/govulncheck@latest
+          govulncheck ./...
       - name: 全平台编译冒烟
         run: ./build-all.sh ci-test

@@ -4,9 +4,12 @@ package cli
 
 import (
 	"bufio"
+	"encoding/json"
 	"fmt"
 	"os"
+	"os/signal"
 	"strings"
+	"syscall"
 
 	"github.com/wangzi5151/autohostswitch/core"
 	"github.com/wangzi5151/autohostswitch/platform"
@@ -67,13 +70,13 @@ func Run(args []string, version string) int {
 	cmd, cargs := rest[0], rest[1:]
 	switch cmd {
 	case "status":
-		return cmdStatus(store, version)
+		return cmdStatus(store, version, cargs)
 	case "show":
 		return cmdShow(store)
 	case "snapshot", "snap":
 		return cmdSnapshot(store, cargs)
 	case "snapshots", "list":
-		return cmdListSnapshots(store)
+		return cmdListSnapshots(store, cargs)
 	case "restore":
 		return cmdRestore(store, cargs)
 	case "restore-original":
@@ -81,7 +84,7 @@ func Run(args []string, version string) int {
 	case "undo":
 		return cmdUndo(store)
 	case "profiles":
-		return cmdListProfiles(store)
+		return cmdListProfiles(store, cargs)
 	case "apply":
 		return cmdApply(store, cargs)
 	case "add-profile":
@@ -123,6 +126,26 @@ func Run(args []string, version string) int {
 func fail(format string, a ...any) int {
 	fmt.Fprintf(os.Stderr, "失败："+format+"\n", a...)
 	return 1
+}
+
+// hasFlag 检查参数里有没有某个 flag（如 --json）。
+func hasFlag(args []string, flag string) bool {
+	for _, a := range args {
+		if a == flag {
+			return true
+		}
+	}
+	return false
+}
+
+// printJSON 把 v 以 JSON 打到 stdout（给脚本/自动化用）。
+func printJSON(v any) int {
+	data, err := json.MarshalIndent(v, "", "  ")
+	if err != nil {
+		return fail("%s", err.Error())
+	}
+	fmt.Println(string(data))
+	return 0
 }
 
 // 退出码规范（方便脚本调用）：
@@ -198,10 +221,20 @@ func ok(format string, a ...any) int {
 
 // ---------- 子命令 ----------
 
-func cmdStatus(store *core.Store, version string) int {
+func cmdStatus(store *core.Store, version string, args []string) int {
 	writable, _ := platform.Writable(store.HostsPath)
 	snaps, _ := store.ListSnapshots()
 	profs, _ := store.ListProfiles()
+	if hasFlag(args, "--json") {
+		return printJSON(map[string]any{
+			"version": version, "os": platform.OSName(),
+			"hosts_path": store.HostsPath, "writable": writable,
+			"data_dir":  store.DataDir,
+			"snapshots": len(snaps), "profiles": len(profs),
+			"has_original":      store.OriginalSnapshotID() != "",
+			"external_modified": store.ExternalModified(),
+		})
+	}
 	fmt.Printf("AutoHostSwitch %s\n", version)
 	fmt.Printf("系统：%s\n", platform.OSName())
 	fmt.Printf("hosts 路径：%s（%s）\n", store.HostsPath, map[bool]string{true: "可写", false: "只读，需要提权"}[writable])
@@ -237,10 +270,13 @@ func cmdSnapshot(store *core.Store, args []string) int {
 	return ok("快照已创建：「%s」（%s）", snap.Name, snap.CreatedAt)
 }
 
-func cmdListSnapshots(store *core.Store) int {
+func cmdListSnapshots(store *core.Store, args []string) int {
 	list, err := store.ListSnapshots()
 	if err != nil {
 		return fail("%s", err.Error())
+	}
+	if hasFlag(args, "--json") {
+		return printJSON(list)
 	}
 	if len(list) == 0 {
 		fmt.Println("还没有快照。用 snapshot 命令创建一个吧。")
@@ -349,10 +385,13 @@ func cmdUndo(store *core.Store) int {
 	return 0
 }
 
-func cmdListProfiles(store *core.Store) int {
+func cmdListProfiles(store *core.Store, args []string) int {
 	list, err := store.ListProfiles()
 	if err != nil {
 		return fail("%s", err.Error())
+	}
+	if hasFlag(args, "--json") {
+		return printJSON(list)
 	}
 	if len(list) == 0 {
 		fmt.Println("还没有配置。用 add-profile 新建一套吧。")
@@ -384,8 +423,8 @@ func cmdApply(store *core.Store, args []string) int {
 		if err != nil {
 			return exitFor(err)
 		}
-		added, removed := core.DiffSummary(d)
-		fmt.Printf("应用「%s」将：+%d 行 / -%d 行\n", name, added, removed)
+		st := core.DiffSummary(d)
+		fmt.Printf("应用「%s」将：+%d 行 / -%d 行 / ~%d 行修改\n", name, st.Added, st.Removed, st.Modified)
 		fmt.Print(core.RenderDiff(d))
 		return 0
 	}
@@ -601,7 +640,10 @@ func cmdServe(store *core.Store, version string, args []string) int {
 	}
 	fmt.Printf("AutoHostSwitch Web UI 启动中…\n本地访问：http://%s\n按 Ctrl+C 停止。\n", addr)
 	srv := web.NewServer(store, version)
-	if err := srv.ListenAndServe(addr); err != nil {
+	// 优雅关闭：Ctrl+C / kill 时先停监听、做完手头请求再退出，不留残留监听
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
+	if err := srv.ServeGraceful(addr, sigCh); err != nil {
 		return fail("%s", err.Error())
 	}
 	return 0
@@ -659,11 +701,11 @@ func cmdDiff(store *core.Store, args []string) int {
 	if err != nil {
 		return exitFor(err)
 	}
-	added, removed := core.DiffSummary(d)
-	if added == 0 && removed == 0 {
+	st := core.DiffSummary(d)
+	if st.Added == 0 && st.Removed == 0 && st.Modified == 0 {
 		return ok("两边完全一样，没有差异。")
 	}
-	fmt.Printf("%s → %s：+%d 行 / -%d 行\n", args[0], args[1], added, removed)
+	fmt.Printf("%s → %s：+%d 行 / -%d 行 / ~%d 行修改\n", args[0], args[1], st.Added, st.Removed, st.Modified)
 	fmt.Print(core.RenderDiff(d))
 	return 0
 }
@@ -713,7 +755,7 @@ func interactive(version string) int {
 		choice := prompt("请选择 [1-5]：")
 		switch choice {
 		case "1":
-			cmdListSnapshots(store)
+			cmdListSnapshots(store, nil)
 		case "2":
 			profs, err := store.ListProfiles()
 			if err != nil {
@@ -768,16 +810,16 @@ func printHelp() {
 用法：autohostswitch [--hosts 路径] [--data 目录] <命令> [参数]
 
 命令：
-  status                  显示 hosts 路径、权限、快照/配置数量
+  status [--json]           显示 hosts 路径、权限、快照/配置数量
   show                    打印当前 hosts 内容
   snapshot [名] [备注]     把当前 hosts 存成快照
-  snapshots               列出全部快照
+  snapshots [--json]      列出全部快照
   rename-snapshot <旧> <新> [备注]
   del-snapshot <名>        删除快照（原始备份删不掉）
   restore <快照名> [--yes]  从快照恢复 hosts（会先让你确认行数对比）
   restore-original [--yes] 紧急恢复：还原为系统原始 hosts
   undo                    撤销上一次写入（可来回切换）
-  profiles                列出全部配置集
+  profiles [--json]       列出全部配置集
   apply <配置名> [--dry-run]  一键应用配置（自动校验+自动安全快照）；--dry-run 只预览 diff
   add-profile <名> [--from 文件] [--from-current] [--note 备注]
   rename-profile <旧> <新>

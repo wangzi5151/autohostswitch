@@ -11,12 +11,19 @@ import (
 
 // Profile 是一套 hosts 配置方案（如「开发环境」「屏蔽广告」）。
 // 内容存在 profiles/<ID>.hosts，元信息在 profiles.json。
+//
+// 格式版本（FormatVersion）：v1 = 内容为原始 hosts 文本。
+// 未来若引入新格式（如变量、分组），v2+ 在此标记，旧版本读到 >v1 直接拒绝
+// 并提示升级，而不是静默误读。
+const ProfileFormatVersion = 1
+
 type Profile struct {
-	ID        string `json:"id"`
-	Name      string `json:"name"`
-	Note      string `json:"note"`
-	CreatedAt string `json:"created_at"`
-	UpdatedAt string `json:"updated_at"`
+	ID            string `json:"id"`
+	Name          string `json:"name"`
+	Note          string `json:"note"`
+	CreatedAt     string `json:"created_at"`
+	UpdatedAt     string `json:"updated_at"`
+	FormatVersion int    `json:"format_version"`
 }
 
 func (s *Store) profileIndexPath() string { return filepath.Join(s.DataDir, "profiles.json") }
@@ -35,6 +42,17 @@ func (s *Store) loadProfiles() ([]Profile, error) {
 	var list []Profile
 	if err := json.Unmarshal(data, &list); err != nil {
 		return nil, fmt.Errorf("配置索引损坏（%s）：%w", s.profileIndexPath(), err)
+	}
+	// 版本检查：0 视为 v1（v1 之前没写版本号）；>v1 拒绝
+	for _, p := range list {
+		v := p.FormatVersion
+		if v == 0 {
+			v = 1
+		}
+		if v > ProfileFormatVersion {
+			return nil, fmt.Errorf("配置「%s」的格式版本 v%d 太新，当前程序只支持到 v%d，请升级 AutoHostSwitch",
+				p.Name, v, ProfileFormatVersion)
+		}
 	}
 	return list, nil
 }
@@ -59,7 +77,7 @@ func (s *Store) CreateProfile(name, note, content string) (*Profile, error) {
 		return nil, fmt.Errorf("已存在同名配置「%s」，请换个名字", name)
 	}
 	p := Profile{ID: newID(), Name: name, Note: note,
-		CreatedAt: nowStr(), UpdatedAt: nowStr()}
+		CreatedAt: nowStr(), UpdatedAt: nowStr(), FormatVersion: ProfileFormatVersion}
 	if err := os.WriteFile(s.profileFile(p.ID), []byte(NormalizeHosts(content)), 0o644); err != nil {
 		return nil, fmt.Errorf("保存配置内容失败：%w", err)
 	}
@@ -96,7 +114,7 @@ func (s *Store) GetProfile(idOrName string) (*Profile, error) {
 			return &list[i], nil
 		}
 	}
-	return nil, fmt.Errorf("找不到配置「%s」", idOrName)
+	return nil, &ProfileNotFoundError{Query: idOrName}
 }
 
 // ProfileContent 读取配置内容。
@@ -150,7 +168,7 @@ func (s *Store) RenameProfile(idOrName, newName string) error {
 			return s.saveProfiles(list)
 		}
 	}
-	return fmt.Errorf("找不到配置「%s」", idOrName)
+	return &ProfileNotFoundError{Query: idOrName}
 }
 
 // DeleteProfile 删除配置。
@@ -168,7 +186,7 @@ func (s *Store) DeleteProfile(idOrName string) error {
 			return s.saveProfiles(list)
 		}
 	}
-	return fmt.Errorf("找不到配置「%s」", idOrName)
+	return &ProfileNotFoundError{Query: idOrName}
 }
 
 // ApplyProfile 一键应用配置：校验 → 自动安全快照 → 写入 → 日志。

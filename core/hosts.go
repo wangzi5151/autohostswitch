@@ -3,6 +3,7 @@ package core
 import (
 	"fmt"
 	"net"
+	"os"
 	"strings"
 	"unicode"
 	"unicode/utf8"
@@ -172,6 +173,40 @@ func CountLines(content string) int {
 }
 
 // CountStats 返回行数/有效条目数，给 UI 展示用。
+// CountDomains 统计有效映射行里的域名总数。
+func CountDomains(content string) int {
+	n := 0
+	for _, l := range strings.Split(strings.ReplaceAll(content, "\r\n", "\n"), "\n") {
+		t := strings.TrimSpace(l)
+		if t == "" || strings.HasPrefix(t, "#") {
+			continue
+		}
+		if i := strings.Index(t, "#"); i >= 0 {
+			t = strings.TrimSpace(t[:i])
+		}
+		f := strings.Fields(t)
+		if len(f) >= 2 {
+			n += len(f) - 1
+		}
+	}
+	return n
+}
+
+// ExternalModified 检测 hosts 是否被本工具之外的程序改过：
+// 当前文件哈希与上次成功写入后记录的哈希不一致，且确实有过成功写入记录。
+// 注意：CLI 和 Web 可能是两个进程，meta 每次都从磁盘重读，避免内存缓存过期。
+func (s *Store) ExternalModified() bool {
+	_ = s.loadMeta() // 忽略错误：读不到就按“未知”处理
+	if s.meta.LastKnownHash == "" {
+		return false
+	}
+	cur, err := os.ReadFile(s.HostsPath)
+	if err != nil {
+		return false
+	}
+	return HashHosts(string(cur)) != s.meta.LastKnownHash
+}
+
 func CountStats(content string) (total, active int) {
 	for _, l := range strings.Split(strings.ReplaceAll(content, "\r\n", "\n"), "\n") {
 		t := strings.TrimSpace(l)

@@ -33,7 +33,7 @@ func (s *Store) loadSnapshots() ([]Snapshot, error) {
 	}
 	var list []Snapshot
 	if err := json.Unmarshal(data, &list); err != nil {
-		return nil, fmt.Errorf("快照索引损坏（%s）：%w", s.snapIndexPath(), err)
+		return nil, &SnapshotCorruptedError{Detail: fmt.Sprintf("解析 %s 失败：%v", s.snapIndexPath(), err)}
 	}
 	return list, nil
 }
@@ -111,14 +111,14 @@ func (s *Store) GetSnapshot(idOrName string) (*Snapshot, error) {
 			return &list[i], nil
 		}
 	}
-	return nil, fmt.Errorf("找不到快照「%s」", idOrName)
+	return nil, &SnapshotNotFoundError{Query: idOrName}
 }
 
 // SnapshotContent 读取快照的文件内容。
 func (s *Store) SnapshotContent(snap *Snapshot) ([]byte, error) {
 	data, err := os.ReadFile(s.snapFile(snap.ID))
 	if err != nil {
-		return nil, fmt.Errorf("快照文件丢失（%s）：%w", snap.Name, err)
+		return nil, &SnapshotCorruptedError{Name: snap.Name, Detail: "快照文件丢失或无法读取：" + err.Error()}
 	}
 	return data, nil
 }
@@ -142,7 +142,7 @@ func (s *Store) RenameSnapshot(idOrName, newName, newNote string) error {
 			return s.saveSnapshots(list)
 		}
 	}
-	return fmt.Errorf("找不到快照「%s」", idOrName)
+	return &SnapshotNotFoundError{Query: idOrName}
 }
 
 // DeleteSnapshot 删除快照。系统原始备份拒绝删除（那是救命稻草）。
@@ -163,7 +163,7 @@ func (s *Store) DeleteSnapshot(idOrName string) error {
 			return s.saveSnapshots(list)
 		}
 	}
-	return fmt.Errorf("找不到快照「%s」", idOrName)
+	return &SnapshotNotFoundError{Query: idOrName}
 }
 
 // RestoreSnapshot 把快照内容写回 hosts（走统一写入通道：校验+安全快照+日志）。

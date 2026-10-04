@@ -303,9 +303,27 @@ func TestDiffHosts(t *testing.T) {
 	a := "127.0.0.1 a.local\n127.0.0.1 b.local\n"
 	b := "127.0.0.1 a.local\n192.168.1.1 c.local\n"
 	d := DiffHosts(a, b)
-	added, removed := DiffSummary(d)
-	if added != 1 || removed != 1 {
-		t.Fatalf("added=%d removed=%d, want 1/1\n%s", added, removed, RenderDiff(d))
+	st := DiffSummary(d)
+	// 第 2 行被替换：应计为 1 次修改，而不是 1 增 1 删
+	if st.Modified != 1 || st.Added != 0 || st.Removed != 0 {
+		t.Fatalf("stats=%+v, want modified=1\n%s", st, RenderDiff(d))
+	}
+	// 行号：不变行两边都是 2，删除行旧=2，新增行新=2
+	for _, l := range d {
+		switch l.Op {
+		case ' ':
+			if l.OldLine == 0 || l.NewLine == 0 || l.OldLine != l.NewLine {
+				t.Fatalf("不变行行号不对：%+v", l)
+			}
+		case '-':
+			if l.OldLine == 0 || l.NewLine != 0 {
+				t.Fatalf("删除行行号不对：%+v", l)
+			}
+		case '+':
+			if l.NewLine == 0 || l.OldLine != 0 {
+				t.Fatalf("新增行行号不对：%+v", l)
+			}
+		}
 	}
 	if d := DiffHosts(a, a); len(d) != 2 {
 		t.Fatalf("相同内容应全为不变行，got %d", len(d))
@@ -314,6 +332,12 @@ func TestDiffHosts(t *testing.T) {
 		if l.Op != ' ' {
 			t.Fatalf("相同内容不应有增删：%+v", l)
 		}
+	}
+	// 纯新增/纯删除不成对，不计修改
+	d2 := DiffHosts("127.0.0.1 a\n", "127.0.0.1 a\n127.0.0.1 b\n")
+	st2 := DiffSummary(d2)
+	if st2.Added != 1 || st2.Modified != 0 || st2.Removed != 0 {
+		t.Fatalf("纯新增 stats=%+v", st2)
 	}
 }
 

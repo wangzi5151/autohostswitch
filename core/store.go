@@ -24,6 +24,7 @@ import (
 type Store struct {
 	HostsPath string // 当前生效的 hosts 文件路径
 	DataDir   string // 快照/配置/日志存放目录
+	Source    string // 操作来源：CLI / Web（记操作日志用）
 
 	meta meta
 }
@@ -33,6 +34,7 @@ type meta struct {
 	Initialized        bool   `json:"initialized"`
 	OriginalSnapshotID string `json:"original_snapshot_id"`
 	CreatedAt          string `json:"created_at"`
+	LastKnownHash      string `json:"last_known_hash"` // 上次成功写入后的 hosts 哈希（外部修改检测用）
 }
 
 // NewStore 用系统默认路径创建 Store 并初始化。
@@ -42,7 +44,7 @@ func NewStore() (*Store, error) {
 
 // NewStoreWith 允许指定 hosts 路径与数据目录（测试、绿色版、Termux 非 root 练习用）。
 func NewStoreWith(hostsPath, dataDir string) (*Store, error) {
-	s := &Store{HostsPath: hostsPath, DataDir: dataDir}
+	s := &Store{HostsPath: hostsPath, DataDir: dataDir, Source: "CLI"}
 	if err := s.Init(); err != nil {
 		return nil, err
 	}

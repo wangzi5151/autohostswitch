@@ -3,6 +3,36 @@
 格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.0.0/)，
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.4.0] - 2026-10-04
+
+### 安全
+- Web API 纵深防御补齐：Host 头校验（防 DNS rebinding）、严格 JSON（未知字段拒绝）、
+  快照/配置 ID 白名单（防路径穿越）、OPTIONS 预检明确 405、CORS 头一个不设、
+  Ctrl+C / kill 优雅关闭（先停监听再退出，不留残留监听）
+- SECURITY.md 重写：明确“程序会/不会做什么”权限边界、Web 安全设计、写入安全、供应链安全
+
+### 新增
+- 操作历史时间线：结构化日志（时间 / 来源 CLI·Web / 操作 / 成功·失败原因 / 关联快照名），
+  写入失败也会记一笔；Web 日志页改为表格展示；旧日志格式兼容读取
+- 当前状态面板：Web 首页显示文件大小、行数、域名数、修改时间、上次操作，
+  并能检测 hosts 是否被本工具之外的程序改过（跨进程基线比对）
+- Diff 增强：带行号显示；统计区分“新增 / 删除 / 修改”（相邻删+增配对计为修改）
+- CLI `--json`：`status` / `snapshots` / `profiles` 支持 `--json`，方便脚本与自动化
+- 配置集格式版本化：`format_version`（当前 v1），未来格式升级时旧版本读到新版本直接拒绝并提示升级
+- 统一错误类型：`SnapshotNotFoundError` / `SnapshotCorruptedError` / `ProfileNotFoundError`，
+  errors.As 可判定；退出码映射文档化
+- Release 供应链：构建来源证明（GitHub Artifact Attestation，Sigstore 签名），
+  可用 `gh attestation verify` 验证二进制确实由本仓库 CI 构建
+
+### 改进
+- README “为什么我可以相信这个程序？”章节：把安全承诺讲成六条可验证的陈述
+- CI：最小权限（`contents: read`）、新增 `govulncheck` 漏洞扫描
+
+### 测试
+- 新增：快照索引损坏、快照文件丢失、恢复已删除快照、Undo 跨进程重启、
+  校验边界用例 15 组（IPv6/CRLF/TAB/行尾注释/超长域名/中文域名等）、
+  Web 安全中间件（Host/ID/严格 JSON/OPTIONS）、大文件基准（1MB 解析 37ms、10MB 归一化 17ms）
+
 ## [0.3.0] - 2026-10-04
 
 ### 新增

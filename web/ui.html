@@ -86,6 +86,10 @@ footer{color:var(--muted);font-size:12px;padding:0 20px 30px;max-width:1060px}
   <!-- 当前 hosts -->
   <section id="tab-hosts">
     <div class="card">
+      <h2>当前状态</h2>
+      <div id="status-panel" class="muted">加载中…</div>
+    </div>
+    <div class="card">
       <h2>编辑当前 hosts</h2>
       <div class="muted" id="hosts-meta">…</div>
       <div class="ed-wrap" style="margin-top:10px">
@@ -230,6 +234,20 @@ async function loadStatus(){
   if(STATUS.writable){p.textContent="可写";p.classList.add("ok");}
   else{p.textContent="只读（需要提权）";p.classList.add("bad");}
   $("ver").textContent=" · v"+STATUS.version;
+  // 状态面板
+  (function(){
+    const p=$("status-panel");
+    let h='<table>';
+    const row=(k,v)=>{h+="<tr><td class=\"muted\" style=\"width:130px\">"+k+"</td><td>"+v+"</td></tr>";};
+    row("文件大小",fmtBytes(STATUS.file_size||0));
+    row("行数",(STATUS.total_lines||0)+" 行（"+(STATUS.active_lines||0)+" 条有效映射，"+(STATUS.domains||0)+" 个域名）");
+    row("修改时间",esc(STATUS.modified_at||"—"));
+    row("上次操作",STATUS.last_apply_actor?esc(STATUS.last_apply_actor+"（"+STATUS.last_apply_at+"）"):"—");
+    if(STATUS.external_modified){
+      h+="<tr><td class=\"muted\">外部修改</td><td style=\"color:var(--warn)\">⚠ 检测到 hosts 被本工具之外的程序修改过，下次写入前会先让你确认。</td></tr>";
+    }
+    p.innerHTML=h+"</table>";
+  })();
   $("sub-warn").textContent=""; // 由订阅页单独设置
   // 订阅警告文案写死在前端，与后端常量一致，避免多一次请求
   $("sub-warn").textContent="警告：订阅会把远程文本写入你的 hosts。只填写你完全信任的来源（如你自己的服务器），不要填来路不明的 URL，恶意 hosts 可以劫持域名、窃取账号。本功能默认关闭，不会自动更新。";
@@ -300,13 +318,22 @@ function fmtBytes(b){
   do{b/=1024;i++;}while(b>=1024&&i<u.length-1);
   return b.toFixed(1)+" "+u[i];
 }
+function diffStatsText(d){
+  const m=d.modified||0;
+  return "+"+d.added+" 新增 / -"+d.removed+" 删除"+(m?(" / ~"+m+" 修改"):"");
+}
+function diffLineNo(l){
+  // 行号：删除行显示旧行号，新增行显示新行号，不变行显示行号
+  const n=l.op==="-"?l.old_line:(l.op==="+"?l.new_line:l.old_line);
+  return n?String(n).padStart(4," "):"    ";
+}
 function showDiff(el,title,d){
-  if(d.added===0&&d.removed===0){el.innerHTML='<div class="okmsg">'+esc(title)+"：两边完全一样。</div>";return;}
-  let h='<div class="card" style="margin:0"><h2>'+esc(title)+"（+"+d.added+" / -"+d.removed+"）</h2>";
-  h+='<div class="log" style="max-height:260px">';
+  if(d.added===0&&d.removed===0&&!(d.modified)){el.innerHTML='<div class="okmsg">'+esc(title)+"：两边完全一样。</div>";return;}
+  let h='<div class="card" style="margin:0"><h2>'+esc(title)+"（"+diffStatsText(d)+"）</h2>";
+  h+='<div class="log" style="max-height:260px;font-family:ui-monospace,Menlo,Consolas,monospace">';
   for(const l of d.lines.slice(0,200)){
     const cls=l.op==="+"?"color:var(--ok)":(l.op==="-"?"color:var(--bad)":"color:var(--muted)");
-    h+='<div style="'+cls+'">'+esc(l.op+" "+l.text)+"</div>";
+    h+='<div style="'+cls+'"><span style="color:var(--muted)">'+esc(diffLineNo(l))+"</span> "+esc(l.op+" "+l.text)+"</div>";
   }
   if(d.lines.length>200)h+='<div class="muted">…（只显示前 200 行）</div>';
   el.innerHTML=h+"</div></div>";
@@ -394,7 +421,7 @@ async function profAct(act,id){
         const d=await api("/api/diff?from=current&to="+encodeURIComponent("profile:"+id));
         const preview=d.lines.slice(0,30).map(l=>l.op+" "+l.text).join("\n");
         const more=d.lines.length>30?("\n…（共 "+d.lines.length+" 行，只显示前 30 行）"):"";
-        if(!confirmIt("应用后将：+"+d.added+" 行 / -"+d.removed+" 行\n\n"+preview+more+"\n\n确定应用吗？应用前会自动备份当前 hosts。"))return;
+        if(!confirmIt("应用后将："+diffStatsText(d)+"\n\n"+preview+more+"\n\n确定应用吗？应用前会自动备份当前 hosts。"))return;
       }catch(e){ if(!confirmIt("diff 预览失败（"+e.message+"），仍要应用吗？"))return; }
       const r=await api("/api/profiles/"+id+"/apply","POST");
       alert("已应用。"+stepsText(r)+(r.warnings?"\n"+r.warnings:"")); loadHosts(); loadUndoState();
@@ -422,8 +449,15 @@ async function profAct(act,id){
 /* ---------- 备份 / 日志 / 订阅 ---------- */
 async function loadLog(){
   try{
-    const lines=await api("/api/log");
-    $("log-view").textContent=lines.length?lines.join("\n"):"（暂无日志）";
+    const es=await api("/api/log/entries");
+    if(!es.length){$("log-view").innerHTML='<span class="muted">（暂无日志）</span>';return;}
+    let h='<table><tr><th>时间</th><th>来源</th><th>操作</th><th>结果</th><th>快照</th></tr>';
+    for(const e of es.slice().reverse()){
+      const rc=e.result==="成功"?"color:var(--ok)":(e.result==="—"?"":"color:var(--bad)");
+      h+="<tr><td class=\"muted\">"+esc(e.at||"—")+"</td><td>"+esc(e.source||"—")+"</td><td>"+esc(e.action)+"</td>"+
+        "<td style=\""+rc+"\">"+esc(e.result||"—")+"</td><td class=\"muted\">"+esc(e.snapshot||"—")+"</td></tr>";
+    }
+    $("log-view").innerHTML=h+"</table>";
   }catch(e){$("log-view").textContent="读取失败："+e.message;}
 }
 
