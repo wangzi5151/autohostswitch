@@ -1,0 +1,22 @@
+# 构建产物
+dist/
+autohostswitch
+autohostswitch.exe
+
+# Go
+*.test
+*.out
+
+# 本地测试残留
+*-backup.json
+hosts.test
+
+# 编辑器
+.vscode/
+.idea/
+*.swp
+*~
+
+# 系统文件
+.DS_Store
+Thumbs.db

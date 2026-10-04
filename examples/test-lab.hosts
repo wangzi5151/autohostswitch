@@ -1,0 +1,7 @@
+# 测试内网：把测试域名指向内网机器
+127.0.0.1 localhost
+::1 localhost
+
+# 内网服务（改成你的实际地址）
+192.168.10.20 git.lab jenkins.lab
+192.168.10.21 staging.web staging.api

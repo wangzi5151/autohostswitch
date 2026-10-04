@@ -1,0 +1,213 @@
+package core
+
+import (
+	"encoding/json"
+	"fmt"
+	"os"
+	"path/filepath"
+	"sort"
+)
+
+// Snapshot 是一次 hosts 快照的元信息；文件本体存在 snapshots/<ID>.hosts。
+type Snapshot struct {
+	ID        string `json:"id"`
+	Name      string `json:"name"`
+	Note      string `json:"note"`
+	CreatedAt string `json:"created_at"`
+	Auto      bool   `json:"auto"` // true=写入前自动生成的安全快照
+}
+
+func (s *Store) snapIndexPath() string { return filepath.Join(s.DataDir, "snapshots.json") }
+func (s *Store) snapFile(id string) string {
+	return filepath.Join(s.snapDir(), id+".hosts")
+}
+
+// loadSnapshots 读取快照索引（按创建时间倒序）。
+func (s *Store) loadSnapshots() ([]Snapshot, error) {
+	data, err := os.ReadFile(s.snapIndexPath())
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("读取快照索引失败：%w", err)
+	}
+	var list []Snapshot
+	if err := json.Unmarshal(data, &list); err != nil {
+		return nil, fmt.Errorf("快照索引损坏（%s）：%w", s.snapIndexPath(), err)
+	}
+	return list, nil
+}
+
+func (s *Store) saveSnapshots(list []Snapshot) error {
+	data, err := json.MarshalIndent(list, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(s.snapIndexPath(), data, 0o644)
+}
+
+// saveSnapshotFile 把快照内容落盘（内部用，不更新索引调用方负责）。
+func (s *Store) saveSnapshotFile(snap Snapshot, content []byte) error {
+	if err := os.WriteFile(s.snapFile(snap.ID), content, 0o644); err != nil {
+		return fmt.Errorf("保存快照文件失败：%w", err)
+	}
+	list, err := s.loadSnapshots()
+	if err != nil {
+		return err
+	}
+	list = append([]Snapshot{snap}, list...)
+	return s.saveSnapshots(list)
+}
+
+// CreateSnapshot 把当前 hosts 存成快照。note 可为空。
+func (s *Store) CreateSnapshot(name, note string) (*Snapshot, error) {
+	raw, err := os.ReadFile(s.HostsPath)
+	if err != nil {
+		return nil, fmt.Errorf("读取当前 hosts 失败：%w", err)
+	}
+	if name == "" {
+		name = "手动快照 " + nowStr()
+	}
+	snap := Snapshot{ID: newID(), Name: name, Note: note, CreatedAt: nowStr()}
+	if err := s.saveSnapshotFile(snap, raw); err != nil {
+		return nil, err
+	}
+	s.appendLog(fmt.Sprintf("创建快照「%s」", name))
+	return &snap, nil
+}
+
+// CreateSnapshotOfContent 把给定内容存成快照（导入、订阅等场景用）。
+func (s *Store) CreateSnapshotOfContent(name, note string, content []byte, auto bool) (*Snapshot, error) {
+	snap := Snapshot{ID: newID(), Name: name, Note: note, CreatedAt: nowStr(), Auto: auto}
+	if err := s.saveSnapshotFile(snap, content); err != nil {
+		return nil, err
+	}
+	return &snap, nil
+}
+
+// ListSnapshots 返回全部快照（新的在前）。
+func (s *Store) ListSnapshots() ([]Snapshot, error) {
+	list, err := s.loadSnapshots()
+	if err != nil {
+		return nil, err
+	}
+	// 防御性排序：新的在前
+	sort.SliceStable(list, func(i, j int) bool { return list[i].CreatedAt > list[j].CreatedAt })
+	return list, nil
+}
+
+// GetSnapshot 按 ID 或 Name 查找快照（Name 允许重名时返回第一个）。
+func (s *Store) GetSnapshot(idOrName string) (*Snapshot, error) {
+	list, err := s.loadSnapshots()
+	if err != nil {
+		return nil, err
+	}
+	for i := range list {
+		if list[i].ID == idOrName || list[i].Name == idOrName {
+			return &list[i], nil
+		}
+	}
+	return nil, fmt.Errorf("找不到快照「%s」", idOrName)
+}
+
+// SnapshotContent 读取快照的文件内容。
+func (s *Store) SnapshotContent(snap *Snapshot) ([]byte, error) {
+	data, err := os.ReadFile(s.snapFile(snap.ID))
+	if err != nil {
+		return nil, fmt.Errorf("快照文件丢失（%s）：%w", snap.Name, err)
+	}
+	return data, nil
+}
+
+// RenameSnapshot 重命名快照（备注可一并改，传空字符串表示不改备注）。
+func (s *Store) RenameSnapshot(idOrName, newName, newNote string) error {
+	if newName == "" {
+		return fmt.Errorf("新名字不能为空")
+	}
+	list, err := s.loadSnapshots()
+	if err != nil {
+		return err
+	}
+	for i := range list {
+		if list[i].ID == idOrName || list[i].Name == idOrName {
+			list[i].Name = newName
+			if newNote != "" {
+				list[i].Note = newNote
+			}
+			s.appendLog(fmt.Sprintf("快照重命名为「%s」", newName))
+			return s.saveSnapshots(list)
+		}
+	}
+	return fmt.Errorf("找不到快照「%s」", idOrName)
+}
+
+// DeleteSnapshot 删除快照。系统原始备份拒绝删除（那是救命稻草）。
+func (s *Store) DeleteSnapshot(idOrName string) error {
+	if idOrName == s.meta.OriginalSnapshotID {
+		return fmt.Errorf("「系统原始备份」不能删除，它是紧急恢复的最后一道防线")
+	}
+	list, err := s.loadSnapshots()
+	if err != nil {
+		return err
+	}
+	for i := range list {
+		if list[i].ID == idOrName || list[i].Name == idOrName {
+			_ = os.Remove(s.snapFile(list[i].ID)) // 文件丢了也不致命
+			name := list[i].Name
+			list = append(list[:i], list[i+1:]...)
+			s.appendLog(fmt.Sprintf("删除快照「%s」", name))
+			return s.saveSnapshots(list)
+		}
+	}
+	return fmt.Errorf("找不到快照「%s」", idOrName)
+}
+
+// RestoreSnapshot 把快照内容写回 hosts（走统一写入通道：校验+安全快照+日志）。
+func (s *Store) RestoreSnapshot(idOrName string) error {
+	snap, err := s.GetSnapshot(idOrName)
+	if err != nil {
+		return err
+	}
+	content, err := s.SnapshotContent(snap)
+	if err != nil {
+		return err
+	}
+	return s.ApplyHosts(string(content), fmt.Sprintf("从快照「%s」恢复", snap.Name))
+}
+
+// RestoreOriginal 紧急一键恢复：写回首次运行备份的原始 hosts。
+func (s *Store) RestoreOriginal() error {
+	if s.meta.OriginalSnapshotID == "" {
+		return fmt.Errorf("没有找到原始备份，可能数据目录被手动清空过")
+	}
+	snap, err := s.GetSnapshot(s.meta.OriginalSnapshotID)
+	if err != nil {
+		return fmt.Errorf("原始备份快照丢失：%w", err)
+	}
+	content, err := s.SnapshotContent(snap)
+	if err != nil {
+		return err
+	}
+	return s.ApplyHosts(string(content), "紧急恢复：还原为系统原始 hosts")
+}
+
+// createSafetySnapshot 在覆盖前自动生成安全快照。
+// 如果当前内容与最近一次自动快照完全一致则跳过，避免快照泛滥。
+func (s *Store) createSafetySnapshot(current []byte) error {
+	list, err := s.loadSnapshots()
+	if err != nil {
+		return err
+	}
+	for _, snap := range list {
+		if !snap.Auto {
+			continue
+		}
+		if data, err := os.ReadFile(s.snapFile(snap.ID)); err == nil && string(data) == string(current) {
+			return nil // 已经有一份一模一样的安全快照，跳过
+		}
+		break // 只看最新的一份自动快照
+	}
+	_, err = s.CreateSnapshotOfContent("自动安全快照 "+nowStr(),
+		"写入 hosts 前自动生成，防止改错变砖", current, true)
+	return err
+}

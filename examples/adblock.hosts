@@ -1,0 +1,8 @@
+# 屏蔽广告/追踪：把常见广告域名指向空地址
+127.0.0.1 localhost
+::1 localhost
+
+# 示例条目（按需增删，保存前工具会自动校验语法）
+0.0.0.0 ads.example.com
+0.0.0.0 tracker.example.com
+0.0.0.0 metrics.example.net
