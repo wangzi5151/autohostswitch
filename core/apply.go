@@ -1,8 +1,11 @@
 package core
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 
 	"github.com/wangzi5151/autohostswitch/platform"
@@ -29,6 +32,18 @@ func (e *ValidationError) Error() string {
 	return strings.TrimRight(b.String(), "\n")
 }
 
+// ConcurrentChangeError 表示“你读取之后、写入之前，hosts 被别的程序改过”。
+// 为避免覆盖别人的修改，写入已中止。请重新读取后再操作。
+type ConcurrentChangeError struct {
+	// 内部用，不展示
+}
+
+func (e *ConcurrentChangeError) Error() string {
+	return "检测到 hosts 在你读取之后被其他程序修改过（可能是另一个 AutoHostSwitch、文本编辑器或安全软件）。\n" +
+		"为避免覆盖别人的修改，本次写入已中止——你的原文件没有被改动。\n" +
+		"请重新读取最新内容，确认后再操作。"
+}
+
 // WarningsText 把警告单独格式化出来，给用户看但不阻止。
 func WarningsText(issues []Issue) string {
 	var b strings.Builder
@@ -45,62 +60,127 @@ func WarningsText(issues []Issue) string {
 	return strings.TrimRight(b.String(), "\n")
 }
 
-// ApplyHosts 是全工具唯一的 hosts 写入入口。
-// 固定流程：语法校验 → 自动安全快照 → 写入文件 → 记日志。
-// 任何一步失败都不动原文件（校验和快照在前，写入是最后一步）。
-func (s *Store) ApplyHosts(content, actor string) error {
+// HashHosts 返回 hosts 文本的 SHA256，用于并发修改检测。
+func HashHosts(content string) string {
+	sum := sha256.Sum256([]byte(content))
+	return hex.EncodeToString(sum[:])
+}
+
+// ApplyResult 描述一次写入 hosts 的完整阶段，供 UI/CLI 向用户展示进度。
+type ApplyResult struct {
+	Steps    []string // 例如：已通过校验 → 已生成安全快照 → 已原子写入 → 已验证落盘
+	Warnings string   // 非阻塞的警告文本（可空）
+}
+
+// ApplyHosts 是全工具唯一的 hosts 写入入口（不带并发 guard）。
+// 固定流程：语法校验 → 并发检查 → 自动安全快照 → 原子写入 → 落盘验证 → 记日志。
+func (s *Store) ApplyHosts(content, actor string) (*ApplyResult, error) {
+	return s.ApplyHostsGuarded(content, actor, "")
+}
+
+// ApplyHostsGuarded 同 ApplyHosts，但多一层并发保护：
+// expectHash 非空时，要求写入瞬间的文件哈希与它一致，否则报 ConcurrentChangeError。
+// 调用方应在“用户看到内容的那一刻”计算哈希并传入。
+func (s *Store) ApplyHostsGuarded(content, actor, expectHash string) (*ApplyResult, error) {
+	res := &ApplyResult{}
 	issues := ValidateHosts(content)
 	if HasError(issues) {
-		return &ValidationError{Issues: issues}
+		return nil, &ValidationError{Issues: issues}
 	}
 	content = NormalizeHosts(content)
+	res.Steps = append(res.Steps, "已通过语法校验")
 
 	current, err := os.ReadFile(s.HostsPath)
 	if err != nil && !os.IsNotExist(err) {
-		return fmt.Errorf("读取当前 hosts 失败：%w", err)
+		return nil, fmt.Errorf("读取当前 hosts 失败：%w", err)
+	}
+	// 并发修改检测：用户所见版本 vs 即将覆盖的版本
+	if expectHash != "" && HashHosts(string(current)) != expectHash {
+		return nil, &ConcurrentChangeError{}
 	}
 	if string(current) == content {
-		return fmt.Errorf("内容和当前 hosts 完全一样，不用写")
+		return nil, fmt.Errorf("内容和当前 hosts 完全一样，不用写")
 	}
 
-	// 先写权限预检：给中文提示而不是让 WriteFile 抛系统英文
+	// 写权限预检：给中文提示而不是让 WriteFile 抛系统英文
 	if ok, werr := platform.Writable(s.HostsPath); !ok {
-		if werr != nil && !os.IsPermission(werr) && !os.IsNotExist(werr) {
-			// 路径不存在等非权限问题，直接说明
-			return fmt.Errorf("写前检查失败：%w", werr)
-		}
 		if os.IsPermission(werr) || werr == nil {
-			return fmt.Errorf("%s", platform.FriendlyWriteError(
+			return nil, fmt.Errorf("%s", platform.FriendlyWriteError(
 				fmt.Errorf("permission denied"), "autohostswitch"))
 		}
+		return nil, fmt.Errorf("写前检查失败：%w", werr)
 	}
 
 	// 覆盖前自动生成安全快照（内容无变化时内部会跳过）
 	if err := s.createSafetySnapshot(current); err != nil {
-		return fmt.Errorf("生成安全快照失败，为保护你的 hosts 已中止写入：%w", err)
+		return nil, fmt.Errorf("生成安全快照失败，为保护你的 hosts 已中止写入：%w", err)
 	}
+	res.Steps = append(res.Steps, "已生成安全快照")
 
-	if err := os.WriteFile(s.HostsPath, []byte(content), 0o644); err != nil {
-		return fmt.Errorf("%s", platform.FriendlyWriteError(err, "autohostswitch"))
+	// 原子写入：临时文件 → fsync → 校验 → 同目录 rename → 读回验证
+	if err := s.atomicWrite(content); err != nil {
+		return nil, err
 	}
+	res.Steps = append(res.Steps, "已原子写入", "已验证落盘内容一致")
+
 	s.appendLog(actor)
-
 	if w := WarningsText(issues); w != "" {
-		// 警告不阻止流程，调用方决定展示
-		return &applyWarnings{msg: actor + " 成功。\n但有几处提醒你看一下：\n" + w}
+		res.Warnings = w
 	}
-	return nil
+	return res, nil
 }
 
-// applyWarnings 是“成功但有警告”的特殊返回，调用方可断言展示。
-type applyWarnings struct{ msg string }
+// atomicWrite 把 content 原子地写入 hosts 文件：
+//  1. 在同目录创建临时文件（保证 rename 时同文件系统，原子替换）
+//  2. 写入后 Sync 落盘，再读回临时文件确认字节一致
+//  3. rename 覆盖目标（POSIX 与 Windows 均为原子替换）
+//  4. 读回目标文件，最终确认内容一致
+//
+// 即使在第 2 步之后程序崩溃/断电，原 hosts 文件也不受影响。
+func (s *Store) atomicWrite(content string) error {
+	dir := filepath.Dir(s.HostsPath)
+	tmp, err := os.CreateTemp(dir, ".autohostswitch-*.tmp")
+	if err != nil {
+		return fmt.Errorf("%s", platform.FriendlyWriteError(err, "autohostswitch"))
+	}
+	tmpName := tmp.Name()
+	// 任何失败都要清理临时文件
+	success := false
+	defer func() {
+		if !success {
+			_ = os.Remove(tmpName)
+		}
+	}()
 
-func (e *applyWarnings) Error() string { return e.msg }
-
-// IsApplyWarnings 判断 err 是否为“成功但有警告”。
-func IsApplyWarnings(err error) bool {
-	_, ok := err.(*applyWarnings)
-	return ok
+	if _, err := tmp.WriteString(content); err != nil {
+		_ = tmp.Close()
+		return fmt.Errorf("%s", platform.FriendlyWriteError(err, "autohostswitch"))
+	}
+	if err := tmp.Sync(); err != nil {
+		_ = tmp.Close()
+		return fmt.Errorf("刷盘失败（Sync）：%w", err)
+	}
+	if err := tmp.Close(); err != nil {
+		return fmt.Errorf("关闭临时文件失败：%w", err)
+	}
+	// 校验临时文件内容
+	if data, err := os.ReadFile(tmpName); err != nil || string(data) != content {
+		return fmt.Errorf("临时文件校验不一致，已中止写入（原文件未动）")
+	}
+	// 原子替换
+	if err := os.Rename(tmpName, s.HostsPath); err != nil {
+		return fmt.Errorf("%s", platform.FriendlyWriteError(err, "autohostswitch"))
+	}
+	// 尽力 fsync 目录（Unix），提高 rename 的持久性；失败不致命
+	syncDir(dir)
+	// 最终验证：读回确认
+	if back, err := os.ReadFile(s.HostsPath); err != nil {
+		return fmt.Errorf("写入后读回失败：%w", err)
+	} else if string(back) != content {
+		return fmt.Errorf("写入后校验不一致：落盘内容与预期不符，请检查磁盘")
+	}
+	success = true
+	return nil
 }
 
 // ReadCurrentHosts 读取当前 hosts 文本。

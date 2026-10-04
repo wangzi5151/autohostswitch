@@ -104,6 +104,10 @@ func Run(args []string, version string) int {
 		return cmdServe(store, version, cargs)
 	case "subscribe":
 		return cmdSubscribe(store, cargs)
+	case "diff":
+		return cmdDiff(store, cargs)
+	case "prune":
+		return cmdPrune(store)
 	case "help", "--help", "-h":
 		printHelp()
 		return 0
@@ -117,6 +121,72 @@ func Run(args []string, version string) int {
 func fail(format string, a ...any) int {
 	fmt.Fprintf(os.Stderr, "失败："+format+"\n", a...)
 	return 1
+}
+
+// 退出码规范（方便脚本调用）：
+//
+//	0 成功；1 一般错误；2 校验失败；3 权限不足；4 并发冲突（hosts 被外部修改）
+const (
+	exitOK         = 0
+	exitError      = 1
+	exitValidation = 2
+	exitPermission = 3
+	exitConflict   = 4
+)
+
+// exitFor 按错误类型打印中文信息并返回对应退出码。
+func exitFor(err error) int {
+	msg := friendly(err)
+	switch {
+	case isValidationErr(err):
+		fmt.Fprintln(os.Stderr, "失败："+msg)
+		return exitValidation
+	case isPermissionErr(err):
+		fmt.Fprintln(os.Stderr, "失败："+msg)
+		return exitPermission
+	case isConflictErr(err):
+		fmt.Fprintln(os.Stderr, "失败："+msg)
+		return exitConflict
+	default:
+		fmt.Fprintln(os.Stderr, "失败："+msg)
+		return exitError
+	}
+}
+
+// friendlyExit 给交互模式用的错误文本（不打印，只返回）。
+func friendlyExit(err error) string { return friendly(err) }
+
+// printResult 打印写入成功的信息：主消息 + 执行阶段 + 警告。
+// 对应评审第 60 条：让用户看到“已备份 → 正在写入 → 写入成功 → 校验成功”。
+func printResult(msg string, res *core.ApplyResult) {
+	fmt.Println(msg)
+	if res == nil {
+		return
+	}
+	if len(res.Steps) > 0 {
+		fmt.Println("  " + strings.Join(res.Steps, " → "))
+	}
+	if res.Warnings != "" {
+		fmt.Println(res.Warnings)
+	}
+}
+
+func isValidationErr(err error) bool {
+	_, ok := err.(*core.ValidationError)
+	return ok
+}
+
+func isPermissionErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	m := err.Error()
+	return strings.Contains(m, "权限不足") || strings.Contains(m, "permission denied")
+}
+
+func isConflictErr(err error) bool {
+	_, ok := err.(*core.ConcurrentChangeError)
+	return ok
 }
 
 func ok(format string, a ...any) int {
@@ -175,6 +245,9 @@ func cmdListSnapshots(store *core.Store) int {
 		return 0
 	}
 	orig := store.OriginalSnapshotID()
+	if b, n := store.SnapshotsDiskUsage(); n > 0 {
+		fmt.Printf("共 %d 个快照，占用 %s\n", n, formatBytesCLI(b))
+	}
 	for _, s := range list {
 		marks := ""
 		if s.ID == orig {
@@ -192,25 +265,21 @@ func cmdRestore(store *core.Store, args []string) int {
 	if len(args) == 0 {
 		return fail("用法：autohostswitch restore <快照名或ID>")
 	}
-	if err := store.RestoreSnapshot(args[0]); err != nil {
-		if core.IsApplyWarnings(err) {
-			fmt.Println(err.Error())
-			return 0
-		}
-		return fail("%s", friendly(err))
+	res, err := store.RestoreSnapshotGuarded(args[0], currentHash(store))
+	if err != nil {
+		return exitFor(err)
 	}
-	return ok("已从快照恢复 hosts。")
+	printResult("已从快照恢复 hosts。", res)
+	return 0
 }
 
 func cmdRestoreOriginal(store *core.Store) int {
-	if err := store.RestoreOriginal(); err != nil {
-		if core.IsApplyWarnings(err) {
-			fmt.Println(err.Error())
-			return 0
-		}
-		return fail("%s", friendly(err))
+	res, err := store.RestoreOriginal()
+	if err != nil {
+		return exitFor(err)
 	}
-	return ok("已恢复为系统原始 hosts。")
+	printResult("已恢复为系统原始 hosts。", res)
+	return 0
 }
 
 func cmdListProfiles(store *core.Store) int {
@@ -229,17 +298,46 @@ func cmdListProfiles(store *core.Store) int {
 }
 
 func cmdApply(store *core.Store, args []string) int {
-	if len(args) == 0 {
-		return fail("用法：autohostswitch apply <配置名>")
-	}
-	if err := store.ApplyProfile(args[0]); err != nil {
-		if core.IsApplyWarnings(err) {
-			fmt.Println(err.Error())
-			return 0
+	dryRun := false
+	var names []string
+	for _, a := range args {
+		if a == "--dry-run" {
+			dryRun = true
+		} else {
+			names = append(names, a)
 		}
-		return fail("%s", friendly(err))
 	}
-	return ok("配置「%s」已应用到 hosts。", args[0])
+	if len(names) == 0 {
+		return fail("用法：autohostswitch apply <配置名> [--dry-run]")
+	}
+	name := names[0]
+	if dryRun {
+		// 预览：先让你看到底哪些行会被增删，再决定
+		d, err := store.DiffSources("current", "profile:"+name)
+		if err != nil {
+			return exitFor(err)
+		}
+		added, removed := core.DiffSummary(d)
+		fmt.Printf("应用「%s」将：+%d 行 / -%d 行\n", name, added, removed)
+		fmt.Print(core.RenderDiff(d))
+		return 0
+	}
+	res, err := store.ApplyProfileGuarded(name, currentHash(store))
+	if err != nil {
+		return exitFor(err)
+	}
+	printResult(fmt.Sprintf("配置「%s」已应用到 hosts。", name), res)
+	return 0
+}
+
+// currentHash 读取当前 hosts 并算哈希，给并发 guard 用。
+// 读不到时返回空字符串（等于不启用 guard）。
+func currentHash(store *core.Store) string {
+	cur, err := store.ReadCurrentHosts()
+	if err != nil {
+		return ""
+	}
+	return core.HashHosts(cur)
 }
 
 // cmdAddProfile 支持三种来源：--from 文件 / --from-current / 交互输入。
@@ -475,14 +573,54 @@ func cmdSubscribe(store *core.Store, args []string) int {
 		fmt.Println("已取消，内容未写入。")
 		return 0
 	}
-	if err := store.ApplyHosts(content, "应用订阅 "+args[0]); err != nil {
-		if core.IsApplyWarnings(err) {
-			fmt.Println(err.Error())
-			return 0
-		}
-		return fail("%s", friendly(err))
+	res, err := store.ApplyHosts(content, "应用订阅 "+args[0])
+	if err != nil {
+		return exitFor(err)
 	}
-	return ok("订阅已应用到 hosts。")
+	printResult("订阅已应用到 hosts。", res)
+	return 0
+}
+
+// cmdDiff 对两个来源做 diff。
+// 用法：autohostswitch diff <from> <to>
+// 来源：current、snapshot:<名>、profile:<名>
+func cmdDiff(store *core.Store, args []string) int {
+	if len(args) < 2 {
+		return fail("用法：autohostswitch diff <来源A> <来源B>\n来源：current、snapshot:<名>、profile:<名>")
+	}
+	d, err := store.DiffSources(args[0], args[1])
+	if err != nil {
+		return exitFor(err)
+	}
+	added, removed := core.DiffSummary(d)
+	if added == 0 && removed == 0 {
+		return ok("两边完全一样，没有差异。")
+	}
+	fmt.Printf("%s → %s：+%d 行 / -%d 行\n", args[0], args[1], added, removed)
+	fmt.Print(core.RenderDiff(d))
+	return 0
+}
+
+// cmdPrune 一键清理旧自动快照（手动快照和原始备份不受影响）。
+func cmdPrune(store *core.Store) int {
+	d, f := store.PruneAutoSnapshots()
+	if d == 0 {
+		return ok("没有可清理的旧自动快照。")
+	}
+	return ok("已清理 %d 个旧自动快照，释放 %s。", d, formatBytesCLI(f))
+}
+
+func formatBytesCLI(b int64) string {
+	const unit = 1024
+	if b < unit {
+		return fmt.Sprintf("%d B", b)
+	}
+	div, exp := int64(unit), 0
+	for n := b / unit; n >= unit; n /= unit {
+		div *= unit
+		exp++
+	}
+	return fmt.Sprintf("%.1f %cB", float64(b)/float64(div), "KMGTPE"[exp])
 }
 
 // ---------- 数字交互模式 ----------
@@ -528,15 +666,12 @@ func interactive(version string) int {
 				fmt.Println("序号不对。")
 				continue
 			}
-			if err := store.ApplyProfile(profs[idx].Name); err != nil {
-				if core.IsApplyWarnings(err) {
-					fmt.Println(err.Error())
-				} else {
-					fmt.Println("失败：" + friendly(err))
-				}
+			res, err := store.ApplyProfile(profs[idx].Name)
+			if err != nil {
+				fmt.Println("失败：" + friendlyExit(err))
 				continue
 			}
-			fmt.Printf("配置「%s」已应用。\n", profs[idx].Name)
+			printResult(fmt.Sprintf("配置「%s」已应用。", profs[idx].Name), res)
 		case "3":
 			note := prompt("备注（可空，直接回车跳过）：")
 			snap, err := store.CreateSnapshot("", note)
@@ -575,13 +710,15 @@ func printHelp() {
   restore <快照名>         从快照恢复 hosts
   restore-original        紧急恢复：还原为系统原始 hosts
   profiles                列出全部配置集
-  apply <配置名>           一键应用配置（自动校验+自动安全快照）
+  apply <配置名> [--dry-run]  一键应用配置（自动校验+自动安全快照）；--dry-run 只预览 diff
   add-profile <名> [--from 文件] [--from-current] [--note 备注]
   rename-profile <旧> <新>
   del-profile <名>
   validate <文件>          只校验不写入
   export [备份.json]       导出全部快照+配置（本地 JSON）
   import <备份.json>       导入备份（重名自动改名）
+  diff <A> <B>            对比 current / snapshot:<名> / profile:<名>
+  prune                   清理旧自动快照（手动快照不受影响）
   log [--clear]            查看 / 清空操作日志
   serve [--port 8080]      启动内置 Web UI（只绑 127.0.0.1）
   subscribe <URL>          手动拉取订阅（默认关闭，需二次确认）

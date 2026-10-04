@@ -114,7 +114,13 @@ footer{color:var(--muted);font-size:12px;padding:0 20px 30px;max-width:1060px}
     </div>
     <div class="card">
       <h2>快照列表</h2>
+      <div class="row">
+        <span class="muted" id="snap-usage">…</span>
+        <button class="btn" id="btn-prune">清理旧自动快照</button>
+      </div>
+      <div class="muted" style="margin-bottom:8px">自动快照只保留最新 50 个（可配），手动快照永久保留，「系统原始备份」永远删不掉。</div>
       <div id="snap-list" class="muted">加载中…</div>
+      <div id="snap-diff" style="margin-top:10px"></div>
     </div>
   </section>
 
@@ -134,8 +140,9 @@ footer{color:var(--muted);font-size:12px;padding:0 20px 30px;max-width:1060px}
       <div id="prof-msg"></div>
     </div>
     <div class="card">
-      <h2>配置列表 <span class="muted">— 点「应用」一键写入</span></h2>
+      <h2>配置列表 <span class="muted">— 点「应用」一键写入（会先预览 diff）</span></h2>
       <div id="prof-list" class="muted">加载中…</div>
+      <div id="prof-diff" style="margin-top:10px"></div>
     </div>
   </section>
 
@@ -188,7 +195,7 @@ footer{color:var(--muted);font-size:12px;padding:0 20px 30px;max-width:1060px}
   </section>
 </main>
 <footer>
-  AutoHostSwitch · 纯本地运行 · 零遥测 · 零自动更新 · 所有数据只存在本机
+  AutoHostSwitch · 默认离线运行 · 零遥测 · 零自动更新 · 所有数据只存在本机
   <span id="ver"></span>
 </footer>
 
@@ -277,13 +284,41 @@ async function liveValidate(){
 async function loadHosts(){
   const r=await api("/api/hosts");
   $("ta").value=r.path;
+  window.hostsHash=r.content_hash||"";
   $("hosts-meta").textContent="共 "+r.total_lines+" 行，其中 "+r.active_lines+" 条有效映射 · "+(r.writable?"当前身份可直接写入":"当前身份不可写，保存前请先提权");
   renderHL(); liveValidate();
 }
+function stepsText(r){
+  // 把后端返回的执行阶段拼成一行：已校验 → 已备份 → 已写入 → 已验证
+  return (r.steps&&r.steps.length)?("（"+r.steps.join(" → ")+"）"):"";
+}
 
-/* ---------- 快照 ---------- */
+function fmtBytes(b){
+  if(b<1024)return b+" B";
+  const u=["KB","MB","GB"];let i=-1;
+  do{b/=1024;i++;}while(b>=1024&&i<u.length-1);
+  return b.toFixed(1)+" "+u[i];
+}
+function showDiff(el,title,d){
+  if(d.added===0&&d.removed===0){el.innerHTML='<div class="okmsg">'+esc(title)+"：两边完全一样。</div>";return;}
+  let h='<div class="card" style="margin:0"><h2>'+esc(title)+"（+"+d.added+" / -"+d.removed+"）</h2>";
+  h+='<div class="log" style="max-height:260px">';
+  for(const l of d.lines.slice(0,200)){
+    const cls=l.op==="+"?"color:var(--ok)":(l.op==="-"?"color:var(--bad)":"color:var(--muted)");
+    h+='<div style="'+cls+'">'+esc(l.op+" "+l.text)+"</div>";
+  }
+  if(d.lines.length>200)h+='<div class="muted">…（只显示前 200 行）</div>';
+  el.innerHTML=h+"</div></div>";
+}
+async function loadSnapUsage(){
+  try{
+    const u=await api("/api/snapshots/usage");
+    $("snap-usage").textContent="共 "+u.count+" 个快照，占用 "+fmtBytes(u.bytes);
+  }catch(e){$("snap-usage").textContent="";}
+}
 async function loadSnaps(){
   const list=await api("/api/snapshots");
+  loadSnapUsage().catch(()=>{});
   const box=$("snap-list");
   if(list.length===0){box.innerHTML='<span class="muted">还没有快照，先新建一个吧。</span>';return;}
   let h='<table><tr><th>名字</th><th>备注</th><th>创建时间</th><th>操作</th></tr>';
@@ -293,6 +328,7 @@ async function loadSnaps(){
       (s.auto?' <span class="tag auto">自动</span>':"")+"</td><td>"+
       esc(s.note||"—")+"</td><td>"+esc(s.created_at)+"</td><td>"+
       '<button class="btn" data-act="restore" data-id="'+s.id+'">恢复</button> '+
+      '<button class="btn" data-act="diff" data-id="'+s.id+'">对比当前</button> '+
       '<button class="btn" data-act="rename" data-id="'+s.id+'">重命名</button> '+
       '<button class="btn" data-act="dl" data-id="'+s.id+'">导出</button> '+
       (s.is_original?"":'<button class="btn danger" data-act="del" data-id="'+s.id+'">删除</button>')+
@@ -306,7 +342,7 @@ async function snapAct(act,id){
     if(act==="restore"){
       if(!confirmIt("确定把 hosts 恢复到这个快照吗？恢复前会自动再存一份当前状态。"))return;
       const r=await api("/api/snapshots/"+id+"/restore","POST");
-      alert(r.warnings?("已恢复。\n"+r.warnings):"已恢复。"); loadHosts(); loadSnaps();
+      alert("已恢复。"+stepsText(r)+(r.warnings?"\n"+r.warnings:"")); loadHosts(); loadSnaps();
     }else if(act==="rename"){
       const name=prompt("新名字："); if(!name)return;
       const note=prompt("备注（可空）：")||"";
@@ -316,6 +352,11 @@ async function snapAct(act,id){
       await api("/api/snapshots/"+id,"DELETE"); loadSnaps();
     }else if(act==="dl"){
       window.location="/api/snapshots/"+id;
+    }else if(act==="diff"){
+      try{
+        const d=await api("/api/diff?from=current&to="+encodeURIComponent("snapshot:"+id));
+        showDiff($("snap-diff"),"当前 hosts vs 快照",d);
+      }catch(e){alert("失败："+e.message);}
     }
   }catch(e){alert("失败："+e.message);}
 }
@@ -329,6 +370,7 @@ async function loadProfs(){
   for(const p of list){
     h+="<tr><td>"+esc(p.name)+"</td><td>"+esc(p.note||"—")+"</td><td>"+esc(p.updated_at)+"</td><td>"+
       '<button class="btn primary" data-act="apply" data-id="'+p.id+'">应用</button> '+
+      '<button class="btn" data-act="diff" data-id="'+p.id+'">对比当前</button> '+
       '<button class="btn" data-act="edit" data-id="'+p.id+'">查看/编辑</button> '+
       '<button class="btn" data-act="rename" data-id="'+p.id+'">重命名</button> '+
       '<button class="btn danger" data-act="del" data-id="'+p.id+'">删除</button></td></tr>";
@@ -339,9 +381,15 @@ async function loadProfs(){
 async function profAct(act,id){
   try{
     if(act==="apply"){
-      if(!confirmIt("确定应用这套配置吗？应用前会自动备份当前 hosts。"))return;
+      // 先预览 diff，让用户看到底哪些行会被增删（评审第 61-64 条）
+      try{
+        const d=await api("/api/diff?from=current&to="+encodeURIComponent("profile:"+id));
+        const preview=d.lines.slice(0,30).map(l=>l.op+" "+l.text).join("\n");
+        const more=d.lines.length>30?("\n…（共 "+d.lines.length+" 行，只显示前 30 行）"):"";
+        if(!confirmIt("应用后将：+"+d.added+" 行 / -"+d.removed+" 行\n\n"+preview+more+"\n\n确定应用吗？应用前会自动备份当前 hosts。"))return;
+      }catch(e){ if(!confirmIt("diff 预览失败（"+e.message+"），仍要应用吗？"))return; }
       const r=await api("/api/profiles/"+id+"/apply","POST");
-      alert(r.warnings?("已应用。\n"+r.warnings):"已应用。"); loadHosts();
+      alert("已应用。"+stepsText(r)+(r.warnings?"\n"+r.warnings:"")); loadHosts();
     }else if(act==="edit"){
       const r=await api("/api/profiles/"+id);
       const c=prompt("编辑配置内容（完整 hosts 文本）：",r.content);
@@ -354,6 +402,11 @@ async function profAct(act,id){
     }else if(act==="del"){
       if(!confirmIt("确定删除这套配置吗？"))return;
       await api("/api/profiles/"+id,"DELETE"); loadProfs();
+    }else if(act==="diff"){
+      try{
+        const d=await api("/api/diff?from=current&to="+encodeURIComponent("profile:"+id));
+        showDiff($("prof-diff"),"当前 hosts vs 配置",d);
+      }catch(e){alert("失败："+e.message);}
     }
   }catch(e){alert("失败："+e.message);}
 }
@@ -391,10 +444,21 @@ function bind(){
   };
   $("btn-save").onclick=async()=>{
     try{
-      const r=await api("/api/hosts","POST",{content:ta.value});
-      showMsg($("save-msg"),true,r.warnings?("保存成功。\n"+r.warnings):"保存成功，hosts 已更新。");
-      loadStatus();
-    }catch(e){showMsg($("save-msg"),false,e.message);}
+      const r=await api("/api/hosts","POST",{content:ta.value,expected_hash:window.hostsHash||""});
+      showMsg($("save-msg"),true,("保存成功，hosts 已更新。"+stepsText(r)+(r.warnings?"\n"+r.warnings:"")));
+      loadHosts(); loadStatus();
+    }catch(e){
+      // 409 = 并发冲突：hosts 在你编辑期间被外部改过
+      showMsg($("save-msg"),false,e.message+"（如提示被外部修改，请点“重新读取”后再操作）");
+    }
+  };
+  $("btn-prune").onclick=async()=>{
+    if(!confirmIt("清理超出保留上限的旧自动快照？手动快照和原始备份不受影响。"))return;
+    try{
+      const r=await api("/api/snapshots/prune","POST");
+      alert(r.deleted===0?"没有可清理的旧自动快照。":("已清理 "+r.deleted+" 个，释放 "+fmtBytes(r.freed_bytes)+"。"));
+      loadSnaps();
+    }catch(e){alert("失败："+e.message);}
   };
   $("btn-snap-create").onclick=async()=>{
     try{

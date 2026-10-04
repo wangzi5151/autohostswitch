@@ -172,14 +172,14 @@ func (s *Store) DeleteProfile(idOrName string) error {
 }
 
 // ApplyProfile 一键应用配置：校验 → 自动安全快照 → 写入 → 日志。
-func (s *Store) ApplyProfile(idOrName string) error {
+func (s *Store) ApplyProfile(idOrName string) (*ApplyResult, error) {
 	p, err := s.GetProfile(idOrName)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	content, err := s.ProfileContent(p)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	return s.ApplyHosts(content, fmt.Sprintf("应用配置「%s」", p.Name))
 }
@@ -198,4 +198,17 @@ func (s *Store) SeedDefaultProfile() error {
 	// 时间戳函数在 CreateProfile 内部已处理
 	_ = time.Now
 	return err
+}
+
+// ApplyProfileGuarded 同 ApplyProfile，多一层并发保护。
+func (s *Store) ApplyProfileGuarded(idOrName, expectHash string) (*ApplyResult, error) {
+	p, err := s.GetProfile(idOrName)
+	if err != nil {
+		return nil, err
+	}
+	content, err := s.ProfileContent(p)
+	if err != nil {
+		return nil, err
+	}
+	return s.ApplyHostsGuarded(content, "应用配置「"+p.Name+"」", expectHash)
 }

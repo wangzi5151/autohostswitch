@@ -3,6 +3,7 @@ package core
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -28,7 +29,6 @@ func TestValidateHosts_Errors(t *testing.T) {
 		{"缺域名", "127.0.0.1\n", true},
 		{"缺IP", "justahost\n", true},
 		{"非法字符", "127.0.0.1 bad;host\n", true},
-		{"横杠开头", "127.0.0.1 -bad.local\n", true},
 		{"空内容", "", false},
 		{"纯注释", "# hello\n\n", false},
 		{"CRLF", "127.0.0.1 a.local\r\n192.168.1.1 b.local\r\n", false},
@@ -116,8 +116,12 @@ func TestProfileApply(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := s.ApplyProfile(p.Name); err != nil {
+	res, err := s.ApplyProfile(p.Name)
+	if err != nil {
 		t.Fatal(err)
+	}
+	if len(res.Steps) == 0 {
+		t.Fatal("写入应返回执行阶段")
 	}
 	data, _ := os.ReadFile(s.HostsPath)
 	if string(data) != "127.0.0.1 mydev.local\n192.168.1.5 api.test\n" {
@@ -145,10 +149,10 @@ func TestRestoreOriginal(t *testing.T) {
 	if _, err := s.CreateProfile("p1", "", "10.0.0.1 x.local\n"); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.ApplyProfile("p1"); err != nil {
+	if _, err := s.ApplyProfile("p1"); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.RestoreOriginal(); err != nil {
+	if _, err := s.RestoreOriginal(); err != nil {
 		t.Fatal(err)
 	}
 	data, _ := os.ReadFile(s.HostsPath)
@@ -200,5 +204,150 @@ func TestLog(t *testing.T) {
 	lines, _ = s.ReadLog()
 	if len(lines) != 0 {
 		t.Fatal("清空后应无日志")
+	}
+}
+
+func TestAtomicWriteNoTempLeft(t *testing.T) {
+	s := testStore(t, "127.0.0.1 localhost\n")
+	if _, err := s.ApplyHosts("127.0.0.1 a.local\n", "测试写入"); err != nil {
+		t.Fatal(err)
+	}
+	// 同目录不应残留临时文件
+	entries, _ := os.ReadDir(filepath.Dir(s.HostsPath))
+	for _, e := range entries {
+		if strings.HasPrefix(e.Name(), ".autohostswitch-") {
+			t.Fatalf("残留临时文件：%s", e.Name())
+		}
+	}
+	data, _ := os.ReadFile(s.HostsPath)
+	if string(data) != "127.0.0.1 a.local\n" {
+		t.Fatalf("内容不对：%q", data)
+	}
+}
+
+func TestConcurrentChangeGuard(t *testing.T) {
+	s := testStore(t, "127.0.0.1 localhost\n")
+	cur, _ := s.ReadCurrentHosts()
+	hash := HashHosts(cur)
+	// 模拟：用户读取之后，别的程序改了 hosts
+	_ = os.WriteFile(s.HostsPath, []byte("10.0.0.1 evil.local\n"), 0o644)
+	_, err := s.ApplyHostsGuarded("127.0.0.1 mine.local\n", "测试", hash)
+	if _, ok := err.(*ConcurrentChangeError); !ok {
+		t.Fatalf("应报并发冲突，got %v", err)
+	}
+	// 外部修改不应被覆盖
+	data, _ := os.ReadFile(s.HostsPath)
+	if string(data) != "10.0.0.1 evil.local\n" {
+		t.Fatalf("外部修改被覆盖了：%q", data)
+	}
+	// hash 对上时正常写入
+	cur2, _ := s.ReadCurrentHosts()
+	if _, err := s.ApplyHostsGuarded("127.0.0.1 mine.local\n", "测试", HashHosts(cur2)); err != nil {
+		t.Fatalf("hash 一致时应能写入：%v", err)
+	}
+}
+
+func TestConcurrentChangeGuardEmpty(t *testing.T) {
+	s := testStore(t, "127.0.0.1 localhost\n")
+	// 不传 hash = 不启用 guard（兼容老调用）
+	if _, err := s.ApplyHostsGuarded("127.0.0.1 b.local\n", "测试", ""); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestValidateHosts_Compat(t *testing.T) {
+	// 兼容性：非标准但可能有效的写法 → 警告，不阻止
+	warnCases := []string{
+		"127.0.0.1 -weird.local\n",      // 横杠开头
+		"127.0.0.1 weird-.local\n",      // 横杠结尾
+		"127.0.0.1 under_score.local\n", // 下划线
+		"127.0.0.1 singlelabel\n",       // 单标签内网名
+		"127.0.0.1 a.local.\n",          // FQDN 尾点
+		"127.0.0.1\ttab.local\n",        // TAB 分隔
+		"127.0.0.1 UPPER.LOCAL\n",       // 大写
+	}
+	for _, c := range warnCases {
+		issues := ValidateHosts(c)
+		if HasError(issues) {
+			t.Errorf("应为警告而非错误 %q: %+v", c, issues)
+		}
+	}
+	// IPv6 各种写法
+	ipv6Cases := []string{
+		"::1 localhost\n",
+		"fe80::1 link.local\n",
+		"2001:db8::ff00:42:8329 v6.local\n",
+		"::ffff:192.168.1.1 mapped.local\n",
+	}
+	for _, c := range ipv6Cases {
+		if issues := ValidateHosts(c); HasError(issues) {
+			t.Errorf("合法 IPv6 被拒绝 %q: %+v", c, issues)
+		}
+	}
+	// 真正的错误：照样阻止
+	errCases := []string{
+		"127.0.0.1 bad;host\n",
+		"127.0.0.1\n",
+		"999.999.999.999 x.local\n",
+		"127.0.0.1 a..b.local\n", // 空节
+	}
+	for _, c := range errCases {
+		if issues := ValidateHosts(c); !HasError(issues) {
+			t.Errorf("应为错误 %q", c)
+		}
+	}
+}
+
+func TestDiffHosts(t *testing.T) {
+	a := "127.0.0.1 a.local\n127.0.0.1 b.local\n"
+	b := "127.0.0.1 a.local\n192.168.1.1 c.local\n"
+	d := DiffHosts(a, b)
+	added, removed := DiffSummary(d)
+	if added != 1 || removed != 1 {
+		t.Fatalf("added=%d removed=%d, want 1/1\n%s", added, removed, RenderDiff(d))
+	}
+	if d := DiffHosts(a, a); len(d) != 2 {
+		t.Fatalf("相同内容应全为不变行，got %d", len(d))
+	}
+	for _, l := range DiffHosts(a, a) {
+		if l.Op != ' ' {
+			t.Fatalf("相同内容不应有增删：%+v", l)
+		}
+	}
+}
+
+func TestSnapshotRetention(t *testing.T) {
+	t.Setenv("AUTOHOSTSWITCH_AUTO_SNAP_MAX", "5")
+	s := testStore(t, "127.0.0.1 localhost\n")
+	// 造 8 个自动快照（内容各不相同，避免被去重跳过）
+	for i := 0; i < 8; i++ {
+		if _, err := s.CreateSnapshotOfContent("auto", "", []byte("data"+string(rune('a'+i))), true); err != nil {
+			t.Fatal(err)
+		}
+	}
+	list, _ := s.ListSnapshots()
+	autos := 0
+	for _, sn := range list {
+		if sn.Auto {
+			autos++
+		}
+	}
+	if autos != 5 {
+		t.Fatalf("自动快照应被裁到 5 个，实际 %d", autos)
+	}
+	// 手动快照不受影响
+	if _, err := s.CreateSnapshot("手动", ""); err != nil {
+		t.Fatal(err)
+	}
+	// 磁盘占用统计
+	bytes, count := s.SnapshotsDiskUsage()
+	if count == 0 || bytes == 0 {
+		t.Fatal("磁盘占用统计应非零")
+	}
+	// 一键清理
+	s2 := testStore(t, "127.0.0.1 localhost\n")
+	d, f := s2.PruneAutoSnapshots()
+	if d != 0 || f != 0 {
+		t.Fatalf("没有可清理时应返回 0，got %d/%d", d, f)
 	}
 }

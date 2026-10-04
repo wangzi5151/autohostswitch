@@ -82,6 +82,10 @@ func (s *Store) CreateSnapshotOfContent(name, note string, content []byte, auto 
 	if err := s.saveSnapshotFile(snap, content); err != nil {
 		return nil, err
 	}
+	if auto {
+		// 自动快照有保留上限，顺手裁剪最旧的
+		s.pruneAutoSnapshots()
+	}
 	return &snap, nil
 }
 
@@ -163,30 +167,30 @@ func (s *Store) DeleteSnapshot(idOrName string) error {
 }
 
 // RestoreSnapshot 把快照内容写回 hosts（走统一写入通道：校验+安全快照+日志）。
-func (s *Store) RestoreSnapshot(idOrName string) error {
+func (s *Store) RestoreSnapshot(idOrName string) (*ApplyResult, error) {
 	snap, err := s.GetSnapshot(idOrName)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	content, err := s.SnapshotContent(snap)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	return s.ApplyHosts(string(content), fmt.Sprintf("从快照「%s」恢复", snap.Name))
 }
 
 // RestoreOriginal 紧急一键恢复：写回首次运行备份的原始 hosts。
-func (s *Store) RestoreOriginal() error {
+func (s *Store) RestoreOriginal() (*ApplyResult, error) {
 	if s.meta.OriginalSnapshotID == "" {
-		return fmt.Errorf("没有找到原始备份，可能数据目录被手动清空过")
+		return nil, fmt.Errorf("没有找到原始备份，可能数据目录被手动清空过")
 	}
 	snap, err := s.GetSnapshot(s.meta.OriginalSnapshotID)
 	if err != nil {
-		return fmt.Errorf("原始备份快照丢失：%w", err)
+		return nil, fmt.Errorf("原始备份快照丢失：%w", err)
 	}
 	content, err := s.SnapshotContent(snap)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	return s.ApplyHosts(string(content), "紧急恢复：还原为系统原始 hosts")
 }
@@ -210,4 +214,33 @@ func (s *Store) createSafetySnapshot(current []byte) error {
 	_, err = s.CreateSnapshotOfContent("自动安全快照 "+nowStr(),
 		"写入 hosts 前自动生成，防止改错变砖", current, true)
 	return err
+}
+
+// RestoreSnapshotGuarded 同 RestoreSnapshot，多一层并发保护。
+func (s *Store) RestoreSnapshotGuarded(idOrName, expectHash string) (*ApplyResult, error) {
+	snap, err := s.GetSnapshot(idOrName)
+	if err != nil {
+		return nil, err
+	}
+	content, err := s.SnapshotContent(snap)
+	if err != nil {
+		return nil, err
+	}
+	return s.ApplyHostsGuarded(string(content), "从快照「"+snap.Name+"」恢复", expectHash)
+}
+
+// RestoreOriginalGuarded 同 RestoreOriginal，多一层并发保护。
+func (s *Store) RestoreOriginalGuarded(expectHash string) (*ApplyResult, error) {
+	if s.meta.OriginalSnapshotID == "" {
+		return nil, fmt.Errorf("没有找到原始备份，可能数据目录被手动清空过")
+	}
+	snap, err := s.GetSnapshot(s.meta.OriginalSnapshotID)
+	if err != nil {
+		return nil, fmt.Errorf("原始备份快照丢失：%w", err)
+	}
+	content, err := s.SnapshotContent(snap)
+	if err != nil {
+		return nil, err
+	}
+	return s.ApplyHostsGuarded(string(content), "紧急恢复：还原为系统原始 hosts", expectHash)
 }

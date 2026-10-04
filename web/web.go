@@ -38,6 +38,8 @@ func NewServer(store *core.Store, version string) *Server {
 }
 
 // Handler 返回配置好路由的 http.Handler。
+// 安全：所有“写”请求（POST/PUT/DELETE）经过 csrfGuard，
+// 校验 Origin/Referer 防止恶意网页借浏览器偷调本地 API。
 func (sv *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /", sv.handleIndex)
@@ -69,7 +71,57 @@ func (sv *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /api/log/clear", sv.handleClearLog)
 
 	mux.HandleFunc("POST /api/subscribe", sv.handleSubscribe)
-	return mux
+	mux.HandleFunc("GET /api/diff", sv.handleDiff)
+	mux.HandleFunc("GET /api/snapshots/usage", sv.handleSnapshotsUsage)
+	mux.HandleFunc("POST /api/snapshots/prune", sv.handlePruneSnapshots)
+	return csrfGuard(mux)
+}
+
+// csrfGuard：localhost 工具的 CSRF 防线。
+// 浏览器发起的跨站请求一定会带 Origin（fetch POST）或 Referer（表单），
+// 我们要求它必须是本地来源；curl 等非浏览器请求不带 Origin，直接放行。
+// 注意：我们从不设置 CORS 头，浏览器默认的同源策略本就拦掉大部分跨站读取。
+func csrfGuard(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == "GET" || r.Method == "HEAD" {
+			next.ServeHTTP(w, r)
+			return
+		}
+		origin := r.Header.Get("Origin")
+		if origin == "" {
+			origin = r.Header.Get("Referer")
+		}
+		if origin != "" && !isLocalOrigin(origin) {
+			writeErr(w, 403, "已拦截：检测到非本页面发起的修改请求（Origin 校验失败）。"+
+				"如果你是在浏览器里点的按钮，请确认地址栏是 http://127.0.0.1:8080 本机地址。")
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+// isLocalOrigin 判断 origin 是否本地来源（http(s)://127.0.0.1|localhost|[::1][:port]）。
+func isLocalOrigin(origin string) bool {
+	rest := origin
+	if i := strings.Index(rest, "://"); i >= 0 {
+		rest = rest[i+3:]
+	}
+	if i := strings.Index(rest, "/"); i >= 0 {
+		rest = rest[:i]
+	}
+	host := rest
+	if i := strings.LastIndex(rest, ":"); i >= 0 {
+		// 小心 IPv6：[::1]:8080
+		if strings.HasPrefix(rest, "[") {
+			if j := strings.Index(rest, "]"); j >= 0 {
+				host = rest[1:j]
+			}
+		} else if strings.Count(rest, ":") == 1 {
+			host = rest[:i]
+		}
+	}
+	host = strings.ToLower(strings.Trim(host, "[]"))
+	return host == "127.0.0.1" || host == "localhost" || host == "::1"
 }
 
 // ListenAndServe 在 addr（默认 127.0.0.1:8080）上启动服务。
@@ -103,6 +155,15 @@ func writeJSON(w http.ResponseWriter, code int, v any) {
 
 func writeErr(w http.ResponseWriter, code int, msg string) {
 	writeJSON(w, code, map[string]string{"error": msg})
+}
+
+// errCode 把写入类错误映射成 HTTP 状态码：409 留给并发冲突，
+// 前端据此提示用户“重新读取后再操作”。
+func errCode(err error) int {
+	if _, ok := err.(*core.ConcurrentChangeError); ok {
+		return 409
+	}
+	return 400
 }
 
 func readJSON(r *http.Request, v any) error {
@@ -160,26 +221,25 @@ func (sv *Server) handleGetHosts(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, map[string]any{
 		"path": content, "writable": writable,
 		"total_lines": total, "active_lines": active,
+		"content_hash": core.HashHosts(content),
 	})
 }
 
 func (sv *Server) handlePostHosts(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		Content string `json:"content"`
+		Content      string `json:"content"`
+		ExpectedHash string `json:"expected_hash"`
 	}
 	if err := readJSON(r, &req); err != nil {
 		writeErr(w, 400, err.Error())
 		return
 	}
-	if err := sv.Store.ApplyHosts(req.Content, "Web：直接编辑 hosts 并保存"); err != nil {
-		if core.IsApplyWarnings(err) {
-			writeJSON(w, 200, map[string]string{"ok": "true", "warnings": err.Error()})
-			return
-		}
-		writeErr(w, 400, err.Error())
+	res, err := sv.Store.ApplyHostsGuarded(req.Content, "Web：直接编辑 hosts 并保存", req.ExpectedHash)
+	if err != nil {
+		writeErr(w, errCode(err), err.Error())
 		return
 	}
-	writeJSON(w, 200, map[string]string{"ok": "true"})
+	writeJSON(w, 200, map[string]any{"ok": "true", "steps": res.Steps, "warnings": res.Warnings})
 }
 
 func (sv *Server) handleValidate(w http.ResponseWriter, r *http.Request) {
@@ -280,15 +340,12 @@ func (sv *Server) handleDeleteSnapshot(w http.ResponseWriter, r *http.Request) {
 }
 
 func (sv *Server) handleRestoreSnapshot(w http.ResponseWriter, r *http.Request) {
-	if err := sv.Store.RestoreSnapshot(r.PathValue("id")); err != nil {
-		if core.IsApplyWarnings(err) {
-			writeJSON(w, 200, map[string]string{"ok": "true", "warnings": err.Error()})
-			return
-		}
-		writeErr(w, 400, err.Error())
+	res, err := sv.Store.RestoreSnapshot(r.PathValue("id"))
+	if err != nil {
+		writeErr(w, errCode(err), err.Error())
 		return
 	}
-	writeJSON(w, 200, map[string]string{"ok": "true"})
+	writeJSON(w, 200, map[string]any{"ok": "true", "steps": res.Steps, "warnings": res.Warnings})
 }
 
 // ---------- 配置集 ----------
@@ -368,15 +425,12 @@ func (sv *Server) handleDeleteProfile(w http.ResponseWriter, r *http.Request) {
 }
 
 func (sv *Server) handleApplyProfile(w http.ResponseWriter, r *http.Request) {
-	if err := sv.Store.ApplyProfile(r.PathValue("id")); err != nil {
-		if core.IsApplyWarnings(err) {
-			writeJSON(w, 200, map[string]string{"ok": "true", "warnings": err.Error()})
-			return
-		}
-		writeErr(w, 400, err.Error())
+	res, err := sv.Store.ApplyProfile(r.PathValue("id"))
+	if err != nil {
+		writeErr(w, errCode(err), err.Error())
 		return
 	}
-	writeJSON(w, 200, map[string]string{"ok": "true"})
+	writeJSON(w, 200, map[string]any{"ok": "true", "steps": res.Steps, "warnings": res.Warnings})
 }
 
 // ---------- 备份 / 恢复 / 日志 ----------
@@ -408,15 +462,12 @@ func (sv *Server) handleImport(w http.ResponseWriter, r *http.Request) {
 }
 
 func (sv *Server) handleRestoreOriginal(w http.ResponseWriter, r *http.Request) {
-	if err := sv.Store.RestoreOriginal(); err != nil {
-		if core.IsApplyWarnings(err) {
-			writeJSON(w, 200, map[string]string{"ok": "true", "warnings": err.Error()})
-			return
-		}
-		writeErr(w, 400, err.Error())
+	res, err := sv.Store.RestoreOriginal()
+	if err != nil {
+		writeErr(w, errCode(err), err.Error())
 		return
 	}
-	writeJSON(w, 200, map[string]string{"ok": "true"})
+	writeJSON(w, 200, map[string]any{"ok": "true", "steps": res.Steps, "warnings": res.Warnings})
 }
 
 func (sv *Server) handleGetLog(w http.ResponseWriter, r *http.Request) {
@@ -458,4 +509,37 @@ func (sv *Server) handleSubscribe(w http.ResponseWriter, r *http.Request) {
 		"has_error": core.HasError(issues),
 		"warning":   core.SubscribeWarning,
 	})
+}
+
+// ---------- Diff ----------
+
+// handleDiff 对两个来源做 diff。
+// 参数：from / to，取值为 current、snapshot:<名>、profile:<名>。
+func (sv *Server) handleDiff(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+	d, err := sv.Store.DiffSources(q.Get("from"), q.Get("to"))
+	if err != nil {
+		writeErr(w, 400, err.Error())
+		return
+	}
+	added, removed := core.DiffSummary(d)
+	out := make([]map[string]any, 0, len(d))
+	for _, l := range d {
+		out = append(out, map[string]any{"op": string(l.Op), "text": l.Text})
+	}
+	writeJSON(w, 200, map[string]any{
+		"lines": out, "added": added, "removed": removed,
+	})
+}
+
+// ---------- 快照磁盘占用 ----------
+
+func (sv *Server) handleSnapshotsUsage(w http.ResponseWriter, r *http.Request) {
+	bytes, count := sv.Store.SnapshotsDiskUsage()
+	writeJSON(w, 200, map[string]any{"bytes": bytes, "count": count})
+}
+
+func (sv *Server) handlePruneSnapshots(w http.ResponseWriter, r *http.Request) {
+	d, f := sv.Store.PruneAutoSnapshots()
+	writeJSON(w, 200, map[string]any{"ok": "true", "deleted": d, "freed_bytes": f})
 }

@@ -83,8 +83,16 @@ func ValidateHosts(content string) []Issue {
 		for _, h := range fields[1:] {
 			lh := strings.ToLower(h)
 			if bad, why := badHostname(h); bad {
-				issues = append(issues, Issue{Line: no, Msg: fmt.Sprintf("域名不合法「%s」：%s", truncate(h, 40), why)})
-				continue
+				// 兼容性策略（评审第 12 条）：真正无法用的判错误并阻止写入；
+				// 非标准但可能有效的降级为警告，不阻止。
+				// 横杠开头/结尾属于后者（部分内网 DNS 照单全收）。
+				if why == "hyphen-edge" {
+					issues = append(issues, Issue{Line: no, Warn: true,
+						Msg: fmt.Sprintf("域名「%s」以横杠开头或结尾：非标准写法，部分系统可能不识别", truncate(h, 40))})
+				} else {
+					issues = append(issues, Issue{Line: no, Msg: fmt.Sprintf("域名不合法「%s」：%s", truncate(h, 40), why)})
+					continue
+				}
 			}
 			if strings.Contains(h, "_") {
 				issues = append(issues, Issue{Line: no, Warn: true, Msg: fmt.Sprintf("域名「%s」含下划线：不是标准域名，部分系统可能不识别", truncate(h, 40))})
@@ -126,7 +134,7 @@ func badHostname(h string) (bool, string) {
 			return true, "有一节为空或超过 63 个字符"
 		}
 		if label[0] == '-' || label[len(label)-1] == '-' {
-			return true, "每一节不能以横杠开头或结尾"
+			return true, "hyphen-edge" // 非标准但部分系统可用，调用方降级为警告
 		}
 		for _, r := range label {
 			if r == '_' {
