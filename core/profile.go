@@ -138,7 +138,10 @@ func (s *Store) UpdateProfileContent(idOrName, content string) error {
 	if err := os.WriteFile(s.profileFile(p.ID), []byte(NormalizeHosts(content)), 0o644); err != nil {
 		return fmt.Errorf("保存配置内容失败：%w", err)
 	}
-	list, _ := s.loadProfiles()
+	list, err := s.loadProfiles()
+	if err != nil {
+		return err
+	}
 	for i := range list {
 		if list[i].ID == p.ID {
 			list[i].UpdatedAt = nowStr()
@@ -152,6 +155,9 @@ func (s *Store) UpdateProfileContent(idOrName, content string) error {
 func (s *Store) RenameProfile(idOrName, newName string) error {
 	if newName == "" {
 		return fmt.Errorf("新名字不能为空")
+	}
+	if cur, err := s.GetProfile(idOrName); err == nil && cur.Name == newName {
+		return nil // 改成相同的名字：无操作，直接成功
 	}
 	if _, err := s.GetProfile(newName); err == nil {
 		return fmt.Errorf("已存在同名配置「%s」", newName)

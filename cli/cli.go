@@ -640,6 +640,7 @@ func cmdServe(store *core.Store, version string, args []string) int {
 	}
 	fmt.Printf("AutoHostSwitch Web UI 启动中…\n本地访问：http://%s\n按 Ctrl+C 停止。\n", addr)
 	srv := web.NewServer(store, version)
+	fmt.Printf("本机 API Token：%s\n（curl 调 API 时加 -H \"X-AutoHostSwitch-Token: <token>\"）\n", srv.Token)
 	// 优雅关闭：Ctrl+C / kill 时先停监听、做完手头请求再退出，不留残留监听
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)

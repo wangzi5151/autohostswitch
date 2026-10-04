@@ -27,6 +27,20 @@ jobs:
         run: ./build-all.sh "${GITHUB_REF_NAME}"
       - name: 生成校验和
         run: cd dist && sha256sum * > SHA256SUMS
+      # Release 正文从 CHANGELOG.md 里截取本版本的章节，正式化发布说明
+      - name: 生成 Release 正文
+        run: |
+          VER="${GITHUB_REF_NAME#v}"
+          awk -v ver="$VER" '
+            index($0, "## [" ver "]") == 1 {f=1; next}
+            /^## \[/ {f=0}
+            f {print}
+          ' CHANGELOG.md | sed '/./,$!d' > release-notes.md
+          if [ ! -s release-notes.md ]; then
+            echo "CHANGELOG.md 里没找到 [$VER] 章节，用模板兜底" >&2
+            cp RELEASE_NOTES_TEMPLATE.md release-notes.md
+          fi
+          head -5 release-notes.md
       # 构建来源证明：用 Sigstore 给每个二进制做 attestation，
       # 用户可用 gh attestation verify 验证“这个二进制确实由本仓库 CI 构建”。
       - name: 生成构建来源证明
@@ -37,4 +51,4 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: dist/*
-          body_path: RELEASE_NOTES_TEMPLATE.md
+          body_path: release-notes.md

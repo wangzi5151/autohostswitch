@@ -50,6 +50,9 @@ Web UI 是“高权限本地管理接口”，按以下标准防护：
 6. **严格 JSON**：未知字段直接拒绝，防止参数走私。
 7. **路径参数白名单**：快照/配置 ID 只允许 `[A-Za-z0-9_.-]`，索引被手改也不可能路径穿越。
 8. **优雅关闭**：Ctrl+C / kill 时先停监听、做完手头请求再退出，不留残留监听。
+9. **本机 API token**：服务启动时随机生成 256 位 token，所有 `/api/*` 请求必须带
+   `X-AutoHostSwitch-Token` 头（401 拒绝无 token 请求）。token 只注入到本机 served 的
+   页面里——同源 JS 能读到，恶意网站因同源策略读不到。做到“能访问 localhost ≠ 能控制 AutoHostSwitch”。
 
 目标：**即使用户打开了一个恶意网页，也不能让网页偷偷让 AutoHostSwitch 修改 hosts。**
 

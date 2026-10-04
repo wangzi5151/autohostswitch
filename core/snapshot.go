@@ -15,6 +15,10 @@ type Snapshot struct {
 	Note      string `json:"note"`
 	CreatedAt string `json:"created_at"`
 	Auto      bool   `json:"auto"` // true=写入前自动生成的安全快照
+	// —— 内容元数据（创建时一次算好，列表页直接读索引，不再逐个读文件）——
+	Size  int64  `json:"size"`  // 快照文件字节数
+	Lines int    `json:"lines"` // 行数
+	Hash  string `json:"hash"`  // 内容 SHA256（用于快速比对/去重）
 }
 
 func (s *Store) snapIndexPath() string { return filepath.Join(s.DataDir, "snapshots.json") }
@@ -35,6 +39,19 @@ func (s *Store) loadSnapshots() ([]Snapshot, error) {
 	if err := json.Unmarshal(data, &list); err != nil {
 		return nil, &SnapshotCorruptedError{Detail: fmt.Sprintf("解析 %s 失败：%v", s.snapIndexPath(), err)}
 	}
+	// 回填旧快照缺失的元数据（v0.5.0 之前创建的快照没有这些字段）
+	dirty := false
+	for i := range list {
+		if list[i].Size == 0 && list[i].Hash == "" {
+			if data, err := os.ReadFile(s.snapFile(list[i].ID)); err == nil {
+				fillSnapMeta(&list[i], data)
+				dirty = true
+			}
+		}
+	}
+	if dirty {
+		_ = s.saveSnapshots(list) // 回填失败不致命，下次再试
+	}
 	return list, nil
 }
 
@@ -47,6 +64,13 @@ func (s *Store) saveSnapshots(list []Snapshot) error {
 }
 
 // saveSnapshotFile 把快照内容落盘（内部用，不更新索引调用方负责）。
+// fillSnapMeta 填充快照元数据（大小/行数/哈希）。
+func fillSnapMeta(snap *Snapshot, content []byte) {
+	snap.Size = int64(len(content))
+	snap.Lines = CountLines(string(content))
+	snap.Hash = HashHosts(string(content))
+}
+
 func (s *Store) saveSnapshotFile(snap Snapshot, content []byte) error {
 	if err := os.WriteFile(s.snapFile(snap.ID), content, 0o644); err != nil {
 		return fmt.Errorf("保存快照文件失败：%w", err)
@@ -69,6 +93,7 @@ func (s *Store) CreateSnapshot(name, note string) (*Snapshot, error) {
 		name = "手动快照 " + nowStr()
 	}
 	snap := Snapshot{ID: newID(), Name: name, Note: note, CreatedAt: nowStr()}
+	fillSnapMeta(&snap, raw)
 	if err := s.saveSnapshotFile(snap, raw); err != nil {
 		return nil, err
 	}
@@ -79,6 +104,7 @@ func (s *Store) CreateSnapshot(name, note string) (*Snapshot, error) {
 // CreateSnapshotOfContent 把给定内容存成快照（导入、订阅等场景用）。
 func (s *Store) CreateSnapshotOfContent(name, note string, content []byte, auto bool) (*Snapshot, error) {
 	snap := Snapshot{ID: newID(), Name: name, Note: note, CreatedAt: nowStr(), Auto: auto}
+	fillSnapMeta(&snap, content)
 	if err := s.saveSnapshotFile(snap, content); err != nil {
 		return nil, err
 	}

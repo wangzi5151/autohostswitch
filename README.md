@@ -1,6 +1,9 @@
 # AutoHostSwitch
 
-**默认离线运行、单文件的跨平台 hosts 管理切换工具。**
+**默认纯本地、默认零网络、单文件跨平台的 hosts 管理切换工具。**
+
+> 默认不联网：不自动更新、不遥测、不上传任何数据；
+> 唯一的网络行为是你主动启用的「订阅」功能，且只在你手动点击拉取时访问一次你填写的 URL。
 
 手动改 hosts 的三大痛：改错一行全网瘫痪、找不到文件在哪、改前忘记备份。
 AutoHostSwitch 一次解决：干净、轻量，一键快照、一键切换、一键还原。
@@ -109,8 +112,10 @@ autohostswitch serve                        # Web UI -> http://127.0.0.1:8080
    原子写入（临时文件+fsync+rename）→ 读回验证。任何一步失败，原文件一个字节都不动；
    即使写入瞬间断电，也只会是完整旧文件或完整新文件。每次写入前自动快照 + 一键 Undo。
 3. **恶意网页调不动它**：Web UI 只绑 127.0.0.1；Host 头校验防 DNS rebinding；
-   写接口校验 Origin/Referer 防 CSRF；不设置 CORS 头；请求体限大小；严格 JSON（未知字段拒绝）；
-   路径参数白名单（防穿越）；优雅关闭不留残留监听。
+   写接口校验 Origin/Referer 防 CSRF；不设置 CORS 头；请求体硬上限（超限 413）；
+   严格 JSON（未知字段拒绝）；路径参数白名单（防穿越）；
+   本机 API token（启动时随机，所有 /api/* 请求必须带，恶意网站读不到）；
+   优雅关闭不留残留监听。
 4. **二进制可验证来源**：每个 Release 附 SHA256SUMS + GitHub Artifact Attestation（Sigstore 签名）：
    `gh attestation verify autohostswitch-linux-amd64 --repo wangzi5151/autohostswitch`
 5. **可审计**：零第三方依赖（`go.mod` 无外部模块），hosts 相关逻辑集中在 `core/`，

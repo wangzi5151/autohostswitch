@@ -9,14 +9,19 @@ package web
 
 import (
 	"context"
+	"crypto/rand"
+	"crypto/subtle"
 	_ "embed"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/wangzi5151/autohostswitch/core"
@@ -30,17 +35,54 @@ var uiHTML []byte
 type Server struct {
 	Store   *Store2
 	Version string
+	// Token 是本机 API 认证 token：服务启动时随机生成，
+	// 所有 /api/* 请求必须带 X-AutoHostSwitch-Token 头。
+	// 恶意网页即使绕过 Origin 检查也读不到 token（SOP 禁止跨站读取本页面），
+	// 所以“能访问 localhost ≠ 能控制 AutoHostSwitch”。
+	Token string
+
+	mu        sync.Mutex
+	statCache hostsStatCache
 }
 
 // Store2 是 core.Store 的别名，保持包面干净。
 // （直接用 core.Store 亦可，这里显式声明便于以后扩展。）
 type Store2 = core.Store
 
+// hostsStatCache 缓存 hosts 文件的统计信息，key 为 (mtime, size)：
+// 文件一变 key 就变，不可能读到过期数据；大文件下 /api/status 高频刷新不再重复读全文件。
+type hostsStatCache struct {
+	mtime         time.Time
+	size          int64
+	total, active int
+	domains       int
+}
+
 // NewServer 创建服务实例。
 func NewServer(store *core.Store, version string) *Server {
 	// Web 发起的写入记操作日志时来源标为 Web
 	store.Source = "Web"
-	return &Server{Store: store, Version: version}
+	var b [32]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		panic("生成 API token 失败：" + err.Error())
+	}
+	return &Server{Store: store, Version: version, Token: hex.EncodeToString(b[:])}
+}
+
+// tokenGuard：本机 API 认证。/api/* 必须携带正确的
+// X-AutoHostSwitch-Token 头，否则 401。首页（/）不校验，
+// 因为页面本身就是 token 的载体（同源 JS 才能读到）。
+func (sv *Server) tokenGuard(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasPrefix(r.URL.Path, "/api/") {
+			got := r.Header.Get("X-AutoHostSwitch-Token")
+			if subtle.ConstantTimeCompare([]byte(got), []byte(sv.Token)) != 1 {
+				writeErr(w, 401, "缺少或错误的本机 API token。")
+				return
+			}
+		}
+		next.ServeHTTP(w, r)
+	})
 }
 
 // Handler 返回配置好路由的 http.Handler。
@@ -88,7 +130,27 @@ func (sv *Server) Handler() http.Handler {
 	mux.HandleFunc("OPTIONS /api/", func(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 405, "不允许跨站调用本机 API。")
 	})
-	return hostGuard(csrfGuard(mux))
+	return hostGuard(csrfGuard(sv.tokenGuard(mux)))
+}
+
+// hostOnly 从 Host 头里取出主机名：优先标准库 net.SplitHostPort，
+// 无端口时回退为去括号（兼容 "[::1]"、"::1"、"localhost" 等写法）。
+// 注意不能手工 LastIndex(":") 切——"[::1]"（无端口）会被切坏。
+func hostOnly(hostport string) string {
+	if h, _, err := net.SplitHostPort(hostport); err == nil {
+		return h
+	}
+	// 无端口：去掉一对包围的方括号（IPv6 字面量 "[::1]"）；
+	// 其他原样返回，交给 allowlist 判定（非法输入一律拒绝）。
+	if len(hostport) >= 2 && strings.HasPrefix(hostport, "[") && strings.HasSuffix(hostport, "]") {
+		return hostport[1 : len(hostport)-1]
+	}
+	return hostport
+}
+
+// isLoopbackHost 判断主机名是否为本机（空也放行：HTTP/1.0 无 Host 头的 curl 等）。
+func isLoopbackHost(h string) bool {
+	return h == "" || h == "127.0.0.1" || h == "localhost" || h == "::1"
 }
 
 // hostGuard：防 DNS rebinding。攻击者可让浏览器把 attacker.com 解析到
@@ -96,12 +158,7 @@ func (sv *Server) Handler() http.Handler {
 // attacker.com —— 直接拒绝非本地 Host。
 func hostGuard(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		h := r.Host
-		if i := strings.LastIndex(h, ":"); i >= 0 {
-			h = h[:i]
-		}
-		h = strings.Trim(h, "[]")
-		if h != "" && h != "127.0.0.1" && h != "localhost" && h != "::1" {
+		if !isLoopbackHost(hostOnly(r.Host)) {
 			writeErr(w, 403, "已拦截：Host 头不是本机地址（疑似 DNS rebinding 攻击）。")
 			return
 		}
@@ -199,12 +256,7 @@ func (sv *Server) ServeGraceful(addr string, sigCh <-chan os.Signal) error {
 }
 
 func isLoopbackAddr(addr string) bool {
-	host := addr
-	if i := strings.LastIndex(addr, ":"); i >= 0 {
-		host = addr[:i]
-	}
-	host = strings.Trim(host, "[]")
-	return host == "" || host == "127.0.0.1" || host == "localhost" || host == "::1"
+	return isLoopbackHost(hostOnly(addr))
 }
 
 // ---------- 小工具 ----------
@@ -228,18 +280,36 @@ func errCode(err error) int {
 	return 400
 }
 
-func readJSON(r *http.Request, v any) error {
+// 请求体硬上限：JSON 接口 4MB。
+const maxJSONBody = 4 << 20
+
+// ErrBodyTooLarge 请求体超过硬上限。
+var ErrBodyTooLarge = errors.New("请求体超过 4MB 上限，已拒绝")
+
+// readJSON 严格读取 JSON 请求体：未知字段拒绝；超过 4MB 直接 413。
+// 用 http.MaxBytesReader 做真硬限制（LimitReader 只是静默截断）。
+func readJSON(w http.ResponseWriter, r *http.Request, v any) error {
 	defer r.Body.Close()
-	body, err := io.ReadAll(io.LimitReader(r.Body, 4<<20)) // 4MB 上限
-	if err != nil {
-		return fmt.Errorf("读取请求失败：%w", err)
-	}
-	dec := json.NewDecoder(strings.NewReader(string(body)))
+	r.Body = http.MaxBytesReader(w, r.Body, maxJSONBody)
+	dec := json.NewDecoder(r.Body)
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(v); err != nil {
+		var mbe *http.MaxBytesError
+		if errors.As(err, &mbe) {
+			return ErrBodyTooLarge
+		}
 		return fmt.Errorf("请求 JSON 不合法或含未知字段：%w", err)
 	}
 	return nil
+}
+
+// writeReadErr 把 readJSON 的错误映射成 HTTP 状态码：413 留给超大请求体。
+func writeReadErr(w http.ResponseWriter, err error) {
+	if errors.Is(err, ErrBodyTooLarge) {
+		writeErr(w, 413, err.Error())
+		return
+	}
+	writeErr(w, 400, err.Error())
 }
 
 // validID 纵深防御：快照/配置 ID 只允许安全字符。
@@ -271,7 +341,28 @@ func pathID(w http.ResponseWriter, r *http.Request) (string, bool) {
 
 func (sv *Server) handleIndex(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	_, _ = w.Write(uiHTML)
+	// 把本机 token 注入页面：只有同源 JS 能读到，恶意网站读不到
+	page := strings.Replace(string(uiHTML), "__AHS_TOKEN__", sv.Token, 1)
+	_, _ = io.WriteString(w, page)
+}
+
+// cachedHostsStats 返回 hosts 统计：mtime+size 命中缓存则直接返回，
+// 否则读文件计算一次并缓存。
+func (sv *Server) cachedHostsStats(fi os.FileInfo) (total, active, domains int) {
+	sv.mu.Lock()
+	defer sv.mu.Unlock()
+	if sv.statCache.mtime.Equal(fi.ModTime()) && sv.statCache.size == fi.Size() {
+		return sv.statCache.total, sv.statCache.active, sv.statCache.domains
+	}
+	if content, err := sv.Store.ReadCurrentHosts(); err == nil {
+		total, active = core.CountStats(content)
+		domains = core.CountDomains(content)
+		sv.statCache = hostsStatCache{
+			mtime: fi.ModTime(), size: fi.Size(),
+			total: total, active: active, domains: domains,
+		}
+	}
+	return total, active, domains
 }
 
 func (sv *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
@@ -283,21 +374,26 @@ func (sv *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 		hint = platform.ElevateHint("autohostswitch")
 		_ = werr
 	}
-	// 当前 hosts 状态面板数据
+	// 当前 hosts 状态面板数据（大文件走 mtime+size 缓存，见 hostsStatCache）
 	var size int64
 	var mtime string
 	var total, active, domains int
 	if fi, err := os.Stat(sv.Store.HostsPath); err == nil {
 		size = fi.Size()
 		mtime = fi.ModTime().Format("2006-01-02 15:04:05")
-	}
-	if content, err := sv.Store.ReadCurrentHosts(); err == nil {
-		total, active = core.CountStats(content)
-		domains = core.CountDomains(content)
+		total, active, domains = sv.cachedHostsStats(fi)
 	}
 	lastActor, lastAt := "", ""
 	if la, ok := sv.Store.LastApplyState(); ok {
 		lastActor, lastAt = la.Actor, la.At
+	}
+	latestSnapName, latestSnapAt := "", ""
+	for _, sn := range snaps {
+		if sn.ID == sv.Store.OriginalSnapshotID() {
+			continue
+		}
+		latestSnapName, latestSnapAt = sn.Name, sn.CreatedAt
+		break // 快照列表已按创建时间倒序
 	}
 	writeJSON(w, 200, map[string]any{
 		"version":      sv.Version,
@@ -311,14 +407,16 @@ func (sv *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 		"profiles":     len(profs),
 		"has_original": sv.Store.OriginalSnapshotID() != "",
 		// —— 状态面板 ——
-		"file_size":         size,
-		"modified_at":       mtime,
-		"total_lines":       total,
-		"active_lines":      active,
-		"domains":           domains,
-		"last_apply_actor":  lastActor,
-		"last_apply_at":     lastAt,
-		"external_modified": sv.Store.ExternalModified(),
+		"file_size":          size,
+		"modified_at":        mtime,
+		"total_lines":        total,
+		"active_lines":       active,
+		"domains":            domains,
+		"last_apply_actor":   lastActor,
+		"last_apply_at":      lastAt,
+		"latest_snapshot":    latestSnapName,
+		"latest_snapshot_at": latestSnapAt,
+		"external_modified":  sv.Store.ExternalModified(),
 	})
 }
 
@@ -344,8 +442,8 @@ func (sv *Server) handlePostHosts(w http.ResponseWriter, r *http.Request) {
 		Content      string `json:"content"`
 		ExpectedHash string `json:"expected_hash"`
 	}
-	if err := readJSON(r, &req); err != nil {
-		writeErr(w, 400, err.Error())
+	if err := readJSON(w, r, &req); err != nil {
+		writeReadErr(w, err)
 		return
 	}
 	res, err := sv.Store.ApplyHostsGuarded(req.Content, "Web：直接编辑 hosts 并保存", req.ExpectedHash)
@@ -360,8 +458,8 @@ func (sv *Server) handleValidate(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		Content string `json:"content"`
 	}
-	if err := readJSON(r, &req); err != nil {
-		writeErr(w, 400, err.Error())
+	if err := readJSON(w, r, &req); err != nil {
+		writeReadErr(w, err)
 		return
 	}
 	issues := core.ValidateHosts(req.Content)
@@ -375,6 +473,8 @@ func snapJSON(s core.Snapshot) map[string]any {
 		"id": s.ID, "name": s.Name, "note": s.Note,
 		"created_at": s.CreatedAt, "auto": s.Auto,
 		"is_original": false,
+		// 元数据直接读索引，不读文件（P1-5）
+		"size": s.Size, "lines": s.Lines, "hash": s.Hash,
 	}
 }
 
@@ -389,10 +489,6 @@ func (sv *Server) handleListSnapshots(w http.ResponseWriter, r *http.Request) {
 	for _, s := range list {
 		m := snapJSON(s)
 		m["is_original"] = s.ID == orig
-		// 行数：恢复前确认时展示“当前 N 行 vs 快照 M 行”
-		if content, err := sv.Store.SnapshotContent(&s); err == nil {
-			m["lines"] = core.CountLines(string(content))
-		}
 		out = append(out, m)
 	}
 	writeJSON(w, 200, out)
@@ -403,8 +499,8 @@ func (sv *Server) handleCreateSnapshot(w http.ResponseWriter, r *http.Request) {
 		Name string `json:"name"`
 		Note string `json:"note"`
 	}
-	if err := readJSON(r, &req); err != nil {
-		writeErr(w, 400, err.Error())
+	if err := readJSON(w, r, &req); err != nil {
+		writeReadErr(w, err)
 		return
 	}
 	snap, err := sv.Store.CreateSnapshot(req.Name, req.Note)
@@ -444,8 +540,8 @@ func (sv *Server) handleRenameSnapshot(w http.ResponseWriter, r *http.Request) {
 		Name string `json:"name"`
 		Note string `json:"note"`
 	}
-	if err := readJSON(r, &req); err != nil {
-		writeErr(w, 400, err.Error())
+	if err := readJSON(w, r, &req); err != nil {
+		writeReadErr(w, err)
 		return
 	}
 	if err := sv.Store.RenameSnapshot(id, req.Name, req.Note); err != nil {
@@ -497,8 +593,8 @@ func (sv *Server) handleCreateProfile(w http.ResponseWriter, r *http.Request) {
 		Note    string `json:"note"`
 		Content string `json:"content"`
 	}
-	if err := readJSON(r, &req); err != nil {
-		writeErr(w, 400, err.Error())
+	if err := readJSON(w, r, &req); err != nil {
+		writeReadErr(w, err)
 		return
 	}
 	p, err := sv.Store.CreateProfile(req.Name, req.Note, req.Content)
@@ -532,21 +628,20 @@ func (sv *Server) handleUpdateProfile(w http.ResponseWriter, r *http.Request) {
 		Name    string `json:"name"`
 		Content string `json:"content"`
 	}
-	if err := readJSON(r, &req); err != nil {
-		writeErr(w, 400, err.Error())
+	if err := readJSON(w, r, &req); err != nil {
+		writeReadErr(w, err)
 		return
 	}
 	id, ok := pathID(w, r)
 	if !ok {
 		return
 	}
+	// 全程使用路径里的稳定 ID：重命名只改 Name，绝不把 ID 换成 Name。
 	if req.Name != "" {
 		if err := sv.Store.RenameProfile(id, req.Name); err != nil {
 			writeErr(w, 400, err.Error())
 			return
 		}
-		// 重命名后用新名字继续更新内容
-		id = req.Name
 	}
 	if err := sv.Store.UpdateProfileContent(id, req.Content); err != nil {
 		writeErr(w, 400, err.Error())
@@ -595,9 +690,15 @@ func (sv *Server) handleExport(w http.ResponseWriter, r *http.Request) {
 
 func (sv *Server) handleImport(w http.ResponseWriter, r *http.Request) {
 	defer r.Body.Close()
-	data, err := io.ReadAll(io.LimitReader(r.Body, 16<<20))
+	r.Body = http.MaxBytesReader(w, r.Body, 16<<20) // 导入文件 16MB 硬上限
+	data, err := io.ReadAll(r.Body)
 	if err != nil {
-		writeErr(w, 400, "读取上传文件失败")
+		var mbe *http.MaxBytesError
+		if errors.As(err, &mbe) {
+			writeErr(w, 413, "导入文件超过 16MB 上限，已拒绝")
+		} else {
+			writeErr(w, 400, "读取上传文件失败")
+		}
 		return
 	}
 	ns, np, err := sv.Store.ImportAll(data)
@@ -657,8 +758,8 @@ func (sv *Server) handleSubscribe(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		URL string `json:"url"`
 	}
-	if err := readJSON(r, &req); err != nil {
-		writeErr(w, 400, err.Error())
+	if err := readJSON(w, r, &req); err != nil {
+		writeReadErr(w, err)
 		return
 	}
 	content, err := core.PullSubscription(req.URL)

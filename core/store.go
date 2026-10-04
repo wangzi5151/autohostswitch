@@ -84,6 +84,7 @@ func (s *Store) Init() error {
 		CreatedAt: now,
 		Auto:      false,
 	}
+	fillSnapMeta(&snap, raw)
 	if err := s.saveSnapshotFile(snap, raw); err != nil {
 		return err
 	}

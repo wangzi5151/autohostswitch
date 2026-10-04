@@ -3,6 +3,31 @@
 格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.0.0/)，
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.5.0] - 2026-10-04
+
+### 安全
+- 本机 API token：服务启动时随机生成，所有 `/api/*` 请求必须带 `X-AutoHostSwitch-Token` 头（无 token 401）；token 只注入本机页面，同源 JS 可读、恶意网站读不到
+- Host 头解析改用标准库（`net.SplitHostPort` + 括号回退），正确处理 `[::1]` / `[::1]:8080` 等写法；非 loopback 一律拒绝
+- 请求体改真硬限制（`http.MaxBytesReader`）：JSON 接口超 4MB / 导入超 16MB 直接 413，不再静默截断
+
+### 新增
+- 快照元数据：创建时记录大小/行数/哈希，列表页直接读索引（O(N)），不再逐个读文件
+- 状态统计缓存：按 (mtime, size) 缓存，大文件下高频刷新不再重复读全文件
+- Web 快照表：大小/哈希列 + 搜索框；状态面板新增“最近快照”
+
+### 修复
+- `handleUpdateProfile` 重命名后曾把 ID 换成 Name 再更新（靠名字查找碰巧能用），现全程使用稳定 ID；`RenameProfile` 同名改为无操作成功；`UpdateProfileContent` 不再吞索引读取错误
+- v0.4.0 Release 正文曾是模板占位，已补正式正文；release 工作流今后自动从 CHANGELOG 截取本版本章节生成正文
+
+### 改进
+- README 措辞统一：“默认纯本地、默认零网络、单文件跨平台”
+- 自动快照保留策略实测：8 次写入后自动快照恒为上限数（默认 50），手动快照永久保留
+
+### 测试
+- Profile 全生命周期回归：Create→Rename→Update→Apply→Reload→Delete，ID 全程稳定
+- Web 安全矩阵：Host/Origin/Referer/无 Origin/超大 JSON/未知字段/路径穿越/非法 ID/OPTIONS/token（401/注入/随机性）
+- 大文件基准：50MB 解析 3.2s、10MB 快照+恢复 0.5s、10MB 导出+导入 0.2s
+
 ## [0.4.0] - 2026-10-04
 
 ### 安全

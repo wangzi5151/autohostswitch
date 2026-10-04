@@ -122,6 +122,7 @@ footer{color:var(--muted);font-size:12px;padding:0 20px 30px;max-width:1060px}
       <div class="row">
         <span class="muted" id="snap-usage">…</span>
         <button class="btn" id="btn-prune">清理旧自动快照</button>
+        <input type="text" id="snap-search" placeholder="搜索名字/备注…" style="max-width:200px">
       </div>
       <div class="muted" style="margin-bottom:8px">自动快照只保留最新 50 个（可配），手动快照永久保留，「系统原始备份」永远删不掉。</div>
       <div id="snap-list" class="muted">加载中…</div>
@@ -207,10 +208,11 @@ footer{color:var(--muted);font-size:12px;padding:0 20px 30px;max-width:1060px}
 <script>
 "use strict";
 const $=id=>document.getElementById(id);
+const TOKEN="__AHS_TOKEN__"; // 服务端注入的本机 API token
 const esc=s=>s.replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;");
 
 async function api(path,method,body){
-  const opt={method:method||"GET",headers:{}};
+  const opt={method:method||"GET",headers:{"X-AutoHostSwitch-Token":TOKEN}};
   if(body!==undefined){opt.headers["Content-Type"]="application/json";opt.body=JSON.stringify(body);}
   const r=await fetch(path,opt);
   const t=await r.text();
@@ -243,6 +245,7 @@ async function loadStatus(){
     row("行数",(STATUS.total_lines||0)+" 行（"+(STATUS.active_lines||0)+" 条有效映射，"+(STATUS.domains||0)+" 个域名）");
     row("修改时间",esc(STATUS.modified_at||"—"));
     row("上次操作",STATUS.last_apply_actor?esc(STATUS.last_apply_actor+"（"+STATUS.last_apply_at+"）"):"—");
+    row("最近快照",STATUS.latest_snapshot?esc(STATUS.latest_snapshot+"（"+STATUS.latest_snapshot_at+"）"):"—");
     if(STATUS.external_modified){
       h+="<tr><td class=\"muted\">外部修改</td><td style=\"color:var(--warn)\">⚠ 检测到 hosts 被本工具之外的程序修改过，下次写入前会先让你确认。</td></tr>";
     }
@@ -348,15 +351,22 @@ async function loadSnaps(){
   const list=await api("/api/snapshots");
   window.snapList=list;
   loadSnapUsage().catch(()=>{});
+  renderSnaps(list);
+}
+function renderSnaps(list){
   const box=$("snap-list");
-  if(list.length===0){box.innerHTML='<span class="muted">还没有快照，先新建一个吧。</span>';return;}
-  let h='<table><tr><th>名字</th><th>备注</th><th>创建时间</th><th>行数</th><th>操作</th></tr>';
-  for(const s of list){
+  const kw=($("snap-search").value||"").trim().toLowerCase();
+  const show=kw?list.filter(s=>(s.name+" "+(s.note||"")).toLowerCase().includes(kw)):list;
+  if(show.length===0){box.innerHTML='<span class="muted">'+(kw?"没有匹配的快照。":"还没有快照，先新建一个吧。")+"</span>";return;}
+  let h='<table><tr><th>名字</th><th>备注</th><th>创建时间</th><th>行数</th><th>大小</th><th>哈希</th><th>操作</th></tr>';
+  for(const s of show){
     h+="<tr><td>"+esc(s.name)+
       (s.is_original?' <span class="tag orig">原始备份</span>':"")+
       (s.auto?' <span class="tag auto">自动</span>':"")+"</td><td>"+
       esc(s.note||"—")+"</td><td>"+esc(s.created_at)+"</td><td>"+
       (s.lines!=null?s.lines+" 行":"")+"</td><td>"+
+      (s.size!=null?fmtBytes(s.size):"—")+"</td><td>"+
+      '<span class="muted" title="'+esc(s.hash||"")+'">'+esc((s.hash||"").slice(0,8))+"</span></td><td>"+
       '<button class="btn" data-act="restore" data-id="'+s.id+'">恢复</button> '+
       '<button class="btn" data-act="diff" data-id="'+s.id+'">对比当前</button> '+
       '<button class="btn" data-act="rename" data-id="'+s.id+'">重命名</button> '+
@@ -525,6 +535,7 @@ function bind(){
       loadSnaps();
     }catch(e){alert("失败："+e.message);}
   };
+  $("snap-search").addEventListener("input",()=>renderSnaps(window.snapList||[]));
   $("btn-snap-create").onclick=async()=>{
     try{
       await api("/api/snapshots","POST",{name:$("snap-name").value.trim(),note:$("snap-note").value.trim()});
@@ -549,7 +560,7 @@ function bind(){
     const f=$("file-import").files[0];
     if(!f){showMsg($("backup-msg"),false,"请先选择备份 JSON 文件。");return;}
     try{
-      const r=await fetch("/api/import",{method:"POST",body:f});
+      const r=await fetch("/api/import",{method:"POST",headers:{"X-AutoHostSwitch-Token":TOKEN},body:f});
       const j=await r.json();
       if(!r.ok)throw new Error(j.error||"导入失败");
       showMsg($("backup-msg"),true,"导入成功："+j.snapshots+" 个快照，"+j.profiles+" 个配置。");

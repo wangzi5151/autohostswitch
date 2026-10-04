@@ -170,3 +170,166 @@ func BenchmarkDiffHosts_1MB(b *testing.B) {
 		_ = DiffHosts(a, c)
 	}
 }
+
+// ---------- Profile ID/Name 回归（P0-1）----------
+
+// TestProfileLifecycle 全生命周期：Create→Rename→Update→Apply→Reload→Delete，
+// ID 在任何时候都不变，所有操作都按稳定 ID 生效。
+func TestProfileLifecycle(t *testing.T) {
+	s := testStore(t, "127.0.0.1 localhost\n")
+
+	// Create
+	p, err := s.CreateProfile("dev", "", "127.0.0.1 localhost\n127.0.0.1 dev.local\n")
+	if err != nil {
+		t.Fatal(err)
+	}
+	origID := p.ID
+	if origID == "" {
+		t.Fatal("ID 不应为空")
+	}
+
+	// Rename：ID 必须不变
+	if err := s.RenameProfile(origID, "development"); err != nil {
+		t.Fatal(err)
+	}
+	got, err := s.GetProfile(origID)
+	if err != nil {
+		t.Fatal("重命名后按 ID 查找失败")
+	}
+	if got.ID != origID || got.Name != "development" {
+		t.Fatalf("重命名后 ID/Name 不对：%+v", got)
+	}
+	// 旧名字应找不到了
+	if _, err := s.GetProfile("dev"); err == nil {
+		t.Fatal("旧名字重命名后仍能查到")
+	}
+
+	// Update（用 ID）：内容必须写到同一个文件
+	newContent := "127.0.0.1 localhost\n127.0.0.1 dev.local\n9.9.9.9 new.local\n"
+	if err := s.UpdateProfileContent(origID, newContent); err != nil {
+		t.Fatal(err)
+	}
+	c, err := s.ProfileContent(got)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c != NormalizeHosts(newContent) {
+		t.Fatalf("按 ID 更新后内容不对：%q", c)
+	}
+
+	// Reload：新 Store 实例，ID 依然稳定
+	s2, err := NewStoreWith(s.HostsPath, s.DataDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got2, err := s2.GetProfile(origID)
+	if err != nil {
+		t.Fatal("reload 后按 ID 查找失败")
+	}
+	if got2.Name != "development" {
+		t.Fatalf("reload 后名字丢了：%+v", got2)
+	}
+
+	// Apply（用 ID）
+	if _, err := s2.ApplyProfile(origID); err != nil {
+		t.Fatal(err)
+	}
+	cur, _ := s2.ReadCurrentHosts()
+	if cur != NormalizeHosts(newContent) {
+		t.Fatalf("按 ID 应用后 hosts 不对：%q", cur)
+	}
+
+	// Undo：撤销应用，回到之前
+	if _, err := s2.Undo(); err != nil {
+		t.Fatal(err)
+	}
+
+	// Delete（用 ID）
+	if err := s2.DeleteProfile(origID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s2.GetProfile(origID); err == nil {
+		t.Fatal("删除后仍能查到")
+	}
+	if _, err := os.Stat(s2.profileFile(origID)); !os.IsNotExist(err) {
+		t.Fatal("删除后内容文件还在")
+	}
+}
+
+// TestProfileRenameSameName 改成相同名字应无操作成功。
+func TestProfileRenameSameName(t *testing.T) {
+	s := testStore(t, "127.0.0.1 localhost\n")
+	p, err := s.CreateProfile("dev", "", "127.0.0.1 localhost\n")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.RenameProfile(p.ID, "dev"); err != nil {
+		t.Fatalf("同名重命名应成功：%v", err)
+	}
+}
+
+// ---------- 大文件全链路基准（P3-12）：防止性能倒退 ----------
+
+func BenchmarkParseHosts_50MB(b *testing.B) {
+	content := genBigHosts(50)
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if issues := ValidateHosts(content); HasError(issues) {
+			b.Fatal("不应有错误")
+		}
+	}
+}
+
+// BenchmarkSnapshotRestore_10MB 快照创建 + 恢复全链路。
+func BenchmarkSnapshotRestore_10MB(b *testing.B) {
+	content := genBigHosts(10)
+	dir := b.TempDir()
+	hosts := dir + "/hosts"
+	if err := os.WriteFile(hosts, []byte("127.0.0.1 localhost\n"), 0o644); err != nil {
+		b.Fatal(err)
+	}
+	s, err := NewStoreWith(hosts, dir+"/data")
+	if err != nil {
+		b.Fatal(err)
+	}
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		snap, err := s.CreateSnapshotOfContent("bench", "", []byte(content), false)
+		if err != nil {
+			b.Fatal(err)
+		}
+		if _, err := s.RestoreSnapshot(snap.ID); err != nil {
+			b.Fatal(err)
+		}
+		if err := s.DeleteSnapshot(snap.ID); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+// BenchmarkExportImport_10MB 导出 + 导入全链路。
+func BenchmarkExportImport_10MB(b *testing.B) {
+	content := genBigHosts(10)
+	dir := b.TempDir()
+	hosts := dir + "/hosts"
+	if err := os.WriteFile(hosts, []byte("127.0.0.1 localhost\n"), 0o644); err != nil {
+		b.Fatal(err)
+	}
+	s, err := NewStoreWith(hosts, dir+"/data")
+	if err != nil {
+		b.Fatal(err)
+	}
+	if _, err := s.CreateSnapshotOfContent("bench", "", []byte(content), false); err != nil {
+		b.Fatal(err)
+	}
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		data, err := s.ExportAll()
+		if err != nil {
+			b.Fatal(err)
+		}
+		if _, _, err := s.ImportAll(data); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
