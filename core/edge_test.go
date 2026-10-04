@@ -1,10 +1,14 @@
 package core
 
 import (
+	"encoding/json"
 	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 )
 
@@ -331,5 +335,51 @@ func BenchmarkExportImport_10MB(b *testing.B) {
 		if _, _, err := s.ImportAll(data); err != nil {
 			b.Fatal(err)
 		}
+	}
+}
+
+// ---------- 并发回归（审计 #1）：meta 读写锁 ----------
+
+// TestMetaConcurrentRace 并发 ExternalModified + 写入记哈希，-race 下不应报竞态。
+func TestMetaConcurrentRace(t *testing.T) {
+	s := testStore(t, "127.0.0.1 localhost\n")
+	var wg sync.WaitGroup
+	for i := 0; i < 8; i++ {
+		wg.Add(2)
+		go func(i int) {
+			defer wg.Done()
+			_, _ = s.ApplyHosts(fmt.Sprintf("127.0.0.1 localhost\n127.0.0.%d x%d.test\n", i%250+1, i), "test")
+		}(i)
+		go func() {
+			defer wg.Done()
+			_ = s.ExternalModified()
+		}()
+	}
+	wg.Wait()
+	// meta 落盘后仍是合法 JSON 且关键字段没丢
+	data, err := os.ReadFile(s.metaPath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	var m meta
+	if err := json.Unmarshal(data, &m); err != nil {
+		t.Fatalf("meta.json 损坏：%v", err)
+	}
+	if !m.Initialized || m.LastKnownHash == "" {
+		t.Fatalf("meta 字段丢失：%+v", m)
+	}
+}
+
+// ---------- 订阅回归（审计 #6）：超 2MB 直接拒绝 ----------
+
+func TestPullSubscriptionTooLarge(t *testing.T) {
+	big := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write(make([]byte, (2<<20)+100)) // 零字节，2MB+
+	}))
+	defer big.Close()
+	if _, err := PullSubscription(big.URL); err == nil {
+		t.Fatal("超 2MB 的订阅应被拒绝")
+	} else if !strings.Contains(err.Error(), "2MB") {
+		t.Fatalf("错误信息应提到 2MB：%v", err)
 	}
 }

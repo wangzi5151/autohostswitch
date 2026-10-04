@@ -195,16 +195,17 @@ func CountDomains(content string) int {
 // ExternalModified 检测 hosts 是否被本工具之外的程序改过：
 // 当前文件哈希与上次成功写入后记录的哈希不一致，且确实有过成功写入记录。
 // 注意：CLI 和 Web 可能是两个进程，meta 每次都从磁盘重读，避免内存缓存过期。
+// loadMeta 内部走 setMeta（写锁），与写入后记哈希互斥，无 data race。
 func (s *Store) ExternalModified() bool {
 	_ = s.loadMeta() // 忽略错误：读不到就按“未知”处理
-	if s.meta.LastKnownHash == "" {
+	if s.getMeta().LastKnownHash == "" {
 		return false
 	}
 	cur, err := os.ReadFile(s.HostsPath)
 	if err != nil {
 		return false
 	}
-	return HashHosts(string(cur)) != s.meta.LastKnownHash
+	return HashHosts(string(cur)) != s.getMeta().LastKnownHash
 }
 
 func CountStats(content string) (total, active int) {

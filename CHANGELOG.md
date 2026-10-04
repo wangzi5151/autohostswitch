@@ -3,6 +3,20 @@
 格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.0.0/)，
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.5.1] - 2026-10-04
+
+### 修复
+- Web 并发 data race：`Store.meta` 加读写锁（`ExternalModified` 整体覆写与写入后记哈希并发时竞态）
+- CLI 退出码：`validate` / `add-profile` / `subscribe` 的校验失败路径统一返回 2（之前误返回 1，与文档不一致）
+- 首页加 `Cache-Control: no-store`：token 每次启动随机，防浏览器缓存旧页面导致重启后全 401
+- 索引文件（meta/snapshots/profiles）改原子写入：崩溃不留半截 JSON
+- `isLocalOrigin` 改用 `hostOnly` 标准解析，`[::1].evil.com` 不再误判为本地
+- 订阅超 2MB 直接拒绝，不再静默截断（截断内容可能通过校验被写入）
+
+### 测试
+- `-race` 并发回归：ExternalModified × 写入记哈希
+- Origin 判定矩阵、`[::1].evil.com` 拒绝用例
+
 ## [0.5.0] - 2026-10-04
 
 ### 安全

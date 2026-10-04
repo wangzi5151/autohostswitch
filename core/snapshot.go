@@ -60,7 +60,7 @@ func (s *Store) saveSnapshots(list []Snapshot) error {
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(s.snapIndexPath(), data, 0o644)
+	return atomicWriteFile(s.snapIndexPath(), data, 0o644)
 }
 
 // saveSnapshotFile 把快照内容落盘（内部用，不更新索引调用方负责）。
@@ -173,7 +173,7 @@ func (s *Store) RenameSnapshot(idOrName, newName, newNote string) error {
 
 // DeleteSnapshot 删除快照。系统原始备份拒绝删除（那是救命稻草）。
 func (s *Store) DeleteSnapshot(idOrName string) error {
-	if idOrName == s.meta.OriginalSnapshotID {
+	if idOrName == s.getMeta().OriginalSnapshotID {
 		return fmt.Errorf("「系统原始备份」不能删除，它是紧急恢复的最后一道防线")
 	}
 	list, err := s.loadSnapshots()
@@ -207,10 +207,10 @@ func (s *Store) RestoreSnapshot(idOrName string) (*ApplyResult, error) {
 
 // RestoreOriginal 紧急一键恢复：写回首次运行备份的原始 hosts。
 func (s *Store) RestoreOriginal() (*ApplyResult, error) {
-	if s.meta.OriginalSnapshotID == "" {
+	if s.getMeta().OriginalSnapshotID == "" {
 		return nil, fmt.Errorf("没有找到原始备份，可能数据目录被手动清空过")
 	}
-	snap, err := s.GetSnapshot(s.meta.OriginalSnapshotID)
+	snap, err := s.GetSnapshot(s.getMeta().OriginalSnapshotID)
 	if err != nil {
 		return nil, fmt.Errorf("原始备份快照丢失：%w", err)
 	}
@@ -261,10 +261,10 @@ func (s *Store) RestoreSnapshotGuarded(idOrName, expectHash string) (*ApplyResul
 
 // RestoreOriginalGuarded 同 RestoreOriginal，多一层并发保护。
 func (s *Store) RestoreOriginalGuarded(expectHash string) (*ApplyResult, error) {
-	if s.meta.OriginalSnapshotID == "" {
+	if s.getMeta().OriginalSnapshotID == "" {
 		return nil, fmt.Errorf("没有找到原始备份，可能数据目录被手动清空过")
 	}
-	snap, err := s.GetSnapshot(s.meta.OriginalSnapshotID)
+	snap, err := s.GetSnapshot(s.getMeta().OriginalSnapshotID)
 	if err != nil {
 		return nil, fmt.Errorf("原始备份快照丢失：%w", err)
 	}

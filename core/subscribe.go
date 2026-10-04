@@ -36,10 +36,14 @@ func PullSubscription(url string) (string, error) {
 	if resp.StatusCode != 200 {
 		return "", fmt.Errorf("订阅服务器返回了 %s", resp.Status)
 	}
-	// 限 2MB，防止误填大文件把内存撑爆
-	body, err := io.ReadAll(io.LimitReader(resp.Body, 2<<20))
+	// 硬限 2MB：超限直接报错，绝不静默截断——
+	// 截断后的不完整内容可能通过校验并被写入，等于把残缺 hosts 写进系统
+	body, err := io.ReadAll(io.LimitReader(resp.Body, (2<<20)+1))
 	if err != nil {
 		return "", fmt.Errorf("读取订阅内容失败：%w", err)
+	}
+	if len(body) > 2<<20 {
+		return "", fmt.Errorf("订阅内容超过 2MB 上限，已拒绝（防止截断后写入不完整内容）")
 	}
 	text := strings.TrimSpace(string(body))
 	if text == "" {

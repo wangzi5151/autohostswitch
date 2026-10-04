@@ -58,7 +58,7 @@ func (s *Store) LastApplyState() (la lastApply, ok bool) {
 	return v, true
 }
 
-// clearLastApply 清除撤销点（撤销成功后调用，一次撤销只允许一次）。
+// clearLastApply 清除撤销点：撤销用的快照找不到了，撤销点已无意义，清理掉。
 func (s *Store) clearLastApply() {
 	_ = os.Remove(s.lastApplyPath())
 }

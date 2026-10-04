@@ -151,7 +151,9 @@ func (s *Store) applyHostsGuarded(content, actor, expectHash string) (*ApplyResu
 	}
 	s.appendLogEntry(s.Source, actor, "成功", snapName)
 	// 记录写入后的哈希，供“外部修改检测”用
-	s.meta.LastKnownHash = HashHosts(content)
+	m := s.getMeta()
+	m.LastKnownHash = HashHosts(content)
+	s.setMeta(m)
 	_ = s.saveMeta()
 	if w := WarningsText(issues); w != "" {
 		res.Warnings = w

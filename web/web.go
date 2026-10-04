@@ -198,19 +198,8 @@ func isLocalOrigin(origin string) bool {
 	if i := strings.Index(rest, "/"); i >= 0 {
 		rest = rest[:i]
 	}
-	host := rest
-	if i := strings.LastIndex(rest, ":"); i >= 0 {
-		// 小心 IPv6：[::1]:8080
-		if strings.HasPrefix(rest, "[") {
-			if j := strings.Index(rest, "]"); j >= 0 {
-				host = rest[1:j]
-			}
-		} else if strings.Count(rest, ":") == 1 {
-			host = rest[:i]
-		}
-	}
-	host = strings.ToLower(strings.Trim(host, "[]"))
-	return host == "127.0.0.1" || host == "localhost" || host == "::1"
+	host := strings.ToLower(hostOnly(rest))
+	return isLoopbackHost(host)
 }
 
 // ListenAndServe 在 addr（默认 127.0.0.1:8080）上启动服务。
@@ -341,6 +330,8 @@ func pathID(w http.ResponseWriter, r *http.Request) (string, bool) {
 
 func (sv *Server) handleIndex(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	// token 每次启动随机生成：禁止缓存页面，否则重启服务后旧 token 全 401，页面变砖
+	w.Header().Set("Cache-Control", "no-store")
 	// 把本机 token 注入页面：只有同源 JS 能读到，恶意网站读不到
 	page := strings.Replace(string(uiHTML), "__AHS_TOKEN__", sv.Token, 1)
 	_, _ = io.WriteString(w, page)

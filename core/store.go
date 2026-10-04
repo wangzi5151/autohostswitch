@@ -15,6 +15,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sync"
 	"time"
 
 	"github.com/wangzi5151/autohostswitch/platform"
@@ -26,7 +27,24 @@ type Store struct {
 	DataDir   string // 快照/配置/日志存放目录
 	Source    string // 操作来源：CLI / Web（记操作日志用）
 
-	meta meta
+	// metaMu 保护 meta：Web 每个请求一个 goroutine，
+	// ExternalModified（整体覆写）与写入后记哈希（字段写入）并发时会 data race。
+	metaMu sync.RWMutex
+	meta   meta
+}
+
+// getMeta 返回 meta 的副本（读锁）。
+func (s *Store) getMeta() meta {
+	s.metaMu.RLock()
+	defer s.metaMu.RUnlock()
+	return s.meta
+}
+
+// setMeta 原子替换整个 meta（写锁）。
+func (s *Store) setMeta(m meta) {
+	s.metaMu.Lock()
+	defer s.metaMu.Unlock()
+	s.meta = m
 }
 
 // meta 记录初始化状态与“原始备份”快照 ID（紧急恢复用）。
@@ -62,7 +80,7 @@ func (s *Store) Init() error {
 	if err := s.loadMeta(); err != nil {
 		return err
 	}
-	if s.meta.Initialized {
+	if s.getMeta().Initialized {
 		return nil
 	}
 
@@ -88,7 +106,7 @@ func (s *Store) Init() error {
 	if err := s.saveSnapshotFile(snap, raw); err != nil {
 		return err
 	}
-	s.meta = meta{Initialized: true, OriginalSnapshotID: snap.ID, CreatedAt: now}
+	s.setMeta(meta{Initialized: true, OriginalSnapshotID: snap.ID, CreatedAt: now})
 	if err := s.saveMeta(); err != nil {
 		return err
 	}
@@ -97,7 +115,7 @@ func (s *Store) Init() error {
 }
 
 // OriginalSnapshotID 返回首次运行备份的快照 ID（紧急恢复用）。
-func (s *Store) OriginalSnapshotID() string { return s.meta.OriginalSnapshotID }
+func (s *Store) OriginalSnapshotID() string { return s.getMeta().OriginalSnapshotID }
 
 // snapDir / profileDir 内部目录。
 func (s *Store) snapDir() string    { return filepath.Join(s.DataDir, "snapshots") }
@@ -108,23 +126,63 @@ func (s *Store) loadMeta() error {
 	data, err := os.ReadFile(s.metaPath())
 	if err != nil {
 		if os.IsNotExist(err) {
-			s.meta = meta{}
+			s.setMeta(meta{})
 			return nil
 		}
 		return fmt.Errorf("读取元数据失败：%w", err)
 	}
-	if err := json.Unmarshal(data, &s.meta); err != nil {
+	var m meta
+	if err := json.Unmarshal(data, &m); err != nil {
 		return fmt.Errorf("元数据损坏（%s），可删除该文件后重试：%w", s.metaPath(), err)
 	}
+	s.setMeta(m)
 	return nil
 }
 
 func (s *Store) saveMeta() error {
-	data, err := json.MarshalIndent(s.meta, "", "  ")
+	data, err := json.MarshalIndent(s.getMeta(), "", "  ")
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(s.metaPath(), data, 0o644)
+	// 索引文件也要原子替换：崩溃时不留半截 JSON（见 #4）
+	return atomicWriteFile(s.metaPath(), data, 0o644)
+}
+
+// atomicWriteFile 原子写入小文件（索引/meta 用）：
+// 同目录临时文件 → 写入 → Sync 落盘 → rename 覆盖。
+// 崩溃时要么是旧文件、要么是新文件，绝不会留下半截 JSON。
+func atomicWriteFile(path string, data []byte, perm os.FileMode) error {
+	dir := filepath.Dir(path)
+	tmp, err := os.CreateTemp(dir, ".ahs-*.tmp")
+	if err != nil {
+		return err
+	}
+	tmpName := tmp.Name()
+	success := false
+	defer func() {
+		if !success {
+			_ = os.Remove(tmpName)
+		}
+	}()
+	if _, err := tmp.Write(data); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err := tmp.Sync(); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	if err := os.Chmod(tmpName, perm); err != nil {
+		return err
+	}
+	if err := os.Rename(tmpName, path); err != nil {
+		return err
+	}
+	success = true
+	return nil
 }
 
 // newID 生成快照/配置用的唯一 ID：时间 + 4 字节随机，保证文件名安全。

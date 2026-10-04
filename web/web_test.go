@@ -237,3 +237,24 @@ func TestHostsStatsCache(t *testing.T) {
 		t.Fatalf("文件变化后应重算，got %d", t3)
 	}
 }
+
+func TestIsLocalOrigin(t *testing.T) {
+	good := []string{
+		"http://127.0.0.1:8080", "http://localhost:8080", "http://[::1]:8080",
+		"http://127.0.0.1", "https://localhost", "http://[::1]",
+	}
+	for _, o := range good {
+		if !isLocalOrigin(o) {
+			t.Errorf("%q 应判为本地", o)
+		}
+	}
+	bad := []string{
+		"http://evil.com", "http://127.0.0.1.evil.com", "http://[::1].evil.com",
+		"https://localhost.evil.com", "http://0.0.0.0:8080",
+	}
+	for _, o := range bad {
+		if isLocalOrigin(o) {
+			t.Errorf("%q 不应判为本地", o)
+		}
+	}
+}

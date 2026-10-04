@@ -495,10 +495,7 @@ func cmdAddProfile(store *core.Store, args []string) int {
 		content = string(data)
 	}
 	if _, err := store.CreateProfile(name, note, content); err != nil {
-		if verr, ok := err.(*core.ValidationError); ok {
-			return fail("%s", verr.Error())
-		}
-		return fail("%s", err.Error())
+		return exitFor(err)
 	}
 	return ok("配置「%s」已创建。", name)
 }
@@ -619,7 +616,7 @@ func cmdValidate(args []string) int {
 		}
 	}
 	if core.HasError(issues) {
-		return 1
+		return exitValidation
 	}
 	return 0
 }
@@ -675,7 +672,7 @@ func cmdSubscribe(store *core.Store, args []string) int {
 				fmt.Printf("  第 %d 行：%s\n", it.Line, it.Msg)
 			}
 		}
-		return 1
+		return exitValidation
 	}
 	fmt.Printf("拉取成功（%d 字节），校验通过。\n", len(content))
 	fmt.Print("确认写入 hosts？(y/N)：")

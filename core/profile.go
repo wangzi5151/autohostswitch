@@ -62,7 +62,7 @@ func (s *Store) saveProfiles(list []Profile) error {
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(s.profileIndexPath(), data, 0o644)
+	return atomicWriteFile(s.profileIndexPath(), data, 0o644)
 }
 
 // CreateProfile 新建配置集。content 会先做语法校验，坏内容拒绝入库。

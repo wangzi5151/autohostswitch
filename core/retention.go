@@ -30,7 +30,7 @@ func (s *Store) pruneAutoSnapshots() (deleted int, freedBytes int64) {
 	}
 	var autos []Snapshot
 	for _, sn := range list {
-		if sn.Auto && sn.ID != s.meta.OriginalSnapshotID {
+		if sn.Auto && sn.ID != s.getMeta().OriginalSnapshotID {
 			autos = append(autos, sn)
 		}
 	}
@@ -46,7 +46,7 @@ func (s *Store) pruneAutoSnapshots() (deleted int, freedBytes int64) {
 	}
 	var rest []Snapshot
 	for _, sn := range list {
-		if sn.Auto && sn.ID != s.meta.OriginalSnapshotID && !keep[sn.ID] {
+		if sn.Auto && sn.ID != s.getMeta().OriginalSnapshotID && !keep[sn.ID] {
 			if fi, err := os.Stat(s.snapFile(sn.ID)); err == nil {
 				freedBytes += fi.Size()
 			}
