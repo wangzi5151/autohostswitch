@@ -40,6 +40,8 @@ func (s *Store) appendLogEntry(source, action, result, snapshot string) {
 		line += " | 快照：" + snapshot
 	}
 	line += "\n"
+	s.logMu.Lock()
+	defer s.logMu.Unlock()
 	f, err := os.OpenFile(s.logPath(), os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
 	if err != nil {
 		return
@@ -112,7 +114,9 @@ func (s *Store) ReadLogEntries() ([]LogEntry, error) {
 
 // ClearLog 一键清空日志。
 func (s *Store) ClearLog() error {
-	if err := os.WriteFile(s.logPath(), nil, 0o644); err != nil {
+	s.logMu.Lock()
+	defer s.logMu.Unlock()
+	if err := atomicWriteFile(s.logPath(), nil, 0o644); err != nil {
 		return fmt.Errorf("清空日志失败：%w", err)
 	}
 	return nil

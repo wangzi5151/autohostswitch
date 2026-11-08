@@ -39,18 +39,15 @@ func (s *Store) loadSnapshots() ([]Snapshot, error) {
 	if err := json.Unmarshal(data, &list); err != nil {
 		return nil, &SnapshotCorruptedError{Detail: fmt.Sprintf("解析 %s 失败：%v", s.snapIndexPath(), err)}
 	}
-	// 回填旧快照缺失的元数据（v0.5.0 之前创建的快照没有这些字段）
-	dirty := false
+	// 回填旧快照缺失的元数据（v0.5.0 之前创建的快照没有这些字段）。
+	// 只回填到内存、不在这里回写索引：loadSnapshots 会被并发读调用，
+	// 若读路径顺手写索引，可能覆盖另一个 goroutine 刚保存的新条目。
 	for i := range list {
 		if list[i].Size == 0 && list[i].Hash == "" {
 			if data, err := os.ReadFile(s.snapFile(list[i].ID)); err == nil {
 				fillSnapMeta(&list[i], data)
-				dirty = true
 			}
 		}
-	}
-	if dirty {
-		_ = s.saveSnapshots(list) // 回填失败不致命，下次再试
 	}
 	return list, nil
 }
@@ -72,7 +69,7 @@ func fillSnapMeta(snap *Snapshot, content []byte) {
 }
 
 func (s *Store) saveSnapshotFile(snap Snapshot, content []byte) error {
-	if err := os.WriteFile(s.snapFile(snap.ID), content, 0o644); err != nil {
+	if err := atomicWriteFile(s.snapFile(snap.ID), content, 0o644); err != nil {
 		return fmt.Errorf("保存快照文件失败：%w", err)
 	}
 	list, err := s.loadSnapshots()
@@ -85,6 +82,8 @@ func (s *Store) saveSnapshotFile(snap Snapshot, content []byte) error {
 
 // CreateSnapshot 把当前 hosts 存成快照。note 可为空。
 func (s *Store) CreateSnapshot(name, note string) (*Snapshot, error) {
+	s.dataMu.Lock()
+	defer s.dataMu.Unlock()
 	raw, err := os.ReadFile(s.HostsPath)
 	if err != nil {
 		return nil, fmt.Errorf("读取当前 hosts 失败：%w", err)
@@ -101,8 +100,8 @@ func (s *Store) CreateSnapshot(name, note string) (*Snapshot, error) {
 	return &snap, nil
 }
 
-// CreateSnapshotOfContent 把给定内容存成快照（导入、订阅等场景用）。
-func (s *Store) CreateSnapshotOfContent(name, note string, content []byte, auto bool) (*Snapshot, error) {
+// createSnapshotOfContentLocked 与 CreateSnapshotOfContent 相同，但调用方必须已持有 dataMu。
+func (s *Store) createSnapshotOfContentLocked(name, note string, content []byte, auto bool) (*Snapshot, error) {
 	snap := Snapshot{ID: newID(), Name: name, Note: note, CreatedAt: nowStr(), Auto: auto}
 	fillSnapMeta(&snap, content)
 	if err := s.saveSnapshotFile(snap, content); err != nil {
@@ -110,9 +109,18 @@ func (s *Store) CreateSnapshotOfContent(name, note string, content []byte, auto 
 	}
 	if auto {
 		// 自动快照有保留上限，顺手裁剪最旧的
-		s.pruneAutoSnapshots()
+		if _, _, err := s.pruneAutoSnapshotsLocked(); err != nil {
+			return nil, fmt.Errorf("裁剪旧自动快照失败：%w", err)
+		}
 	}
 	return &snap, nil
+}
+
+// CreateSnapshotOfContent 把给定内容存成快照（导入、订阅等场景用）。
+func (s *Store) CreateSnapshotOfContent(name, note string, content []byte, auto bool) (*Snapshot, error) {
+	s.dataMu.Lock()
+	defer s.dataMu.Unlock()
+	return s.createSnapshotOfContentLocked(name, note, content, auto)
 }
 
 // ListSnapshots 返回全部快照（新的在前）。
@@ -154,6 +162,8 @@ func (s *Store) RenameSnapshot(idOrName, newName, newNote string) error {
 	if newName == "" {
 		return fmt.Errorf("新名字不能为空")
 	}
+	s.dataMu.Lock()
+	defer s.dataMu.Unlock()
 	list, err := s.loadSnapshots()
 	if err != nil {
 		return err
@@ -172,16 +182,21 @@ func (s *Store) RenameSnapshot(idOrName, newName, newNote string) error {
 }
 
 // DeleteSnapshot 删除快照。系统原始备份拒绝删除（那是救命稻草）。
+// 注意：必须先解析出匹配条目的 ID 再判断，不能只比较用户输入字符串——
+// 否则 `del-snapshot 系统原始备份` 用名字就能绕过 ID 检查。
 func (s *Store) DeleteSnapshot(idOrName string) error {
-	if idOrName == s.getMeta().OriginalSnapshotID {
-		return fmt.Errorf("「系统原始备份」不能删除，它是紧急恢复的最后一道防线")
-	}
+	s.dataMu.Lock()
+	defer s.dataMu.Unlock()
 	list, err := s.loadSnapshots()
 	if err != nil {
 		return err
 	}
+	origID := s.getMeta().OriginalSnapshotID
 	for i := range list {
 		if list[i].ID == idOrName || list[i].Name == idOrName {
+			if list[i].ID == origID {
+				return fmt.Errorf("「系统原始备份」不能删除，它是紧急恢复的最后一道防线")
+			}
 			_ = os.Remove(s.snapFile(list[i].ID)) // 文件丢了也不致命
 			name := list[i].Name
 			list = append(list[:i], list[i+1:]...)
@@ -225,6 +240,8 @@ func (s *Store) RestoreOriginal() (*ApplyResult, error) {
 // 如果当前内容与最近一次自动快照完全一致则跳过，避免快照泛滥。
 // 返回实际创建的快照（跳过时返回 nil），供“撤销上一次操作”记录。
 func (s *Store) createSafetySnapshot(current []byte) (*Snapshot, error) {
+	s.dataMu.Lock()
+	defer s.dataMu.Unlock()
 	list, err := s.loadSnapshots()
 	if err != nil {
 		return nil, err
@@ -238,7 +255,7 @@ func (s *Store) createSafetySnapshot(current []byte) (*Snapshot, error) {
 		}
 		break // 只看最新的一份自动快照
 	}
-	snap, err := s.CreateSnapshotOfContent("自动安全快照 "+nowStr(),
+	snap, err := s.createSnapshotOfContentLocked("自动安全快照 "+nowStr(),
 		"写入 hosts 前自动生成，防止改错变砖", current, true)
 	if err != nil {
 		return nil, err

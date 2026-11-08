@@ -31,6 +31,14 @@ type Store struct {
 	// ExternalModified（整体覆写）与写入后记哈希（字段写入）并发时会 data race。
 	metaMu sync.RWMutex
 	meta   meta
+
+	// dataMu 串行化快照/配置/撤销点等“读索引→改内存→写索引”的操作。
+	// Web 每个请求一个 goroutine，没有它并发建快照会互相覆盖、丢条目。
+	dataMu sync.Mutex
+	// logMu 串行化日志追加/清空，避免并发写把同一行写花。
+	logMu sync.Mutex
+	// undoMu 串行化 last_apply.json 的读写，避免撤销点被并发覆盖。
+	undoMu sync.Mutex
 }
 
 // getMeta 返回 meta 的副本（读锁）。

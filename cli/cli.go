@@ -5,6 +5,7 @@ package cli
 import (
 	"bufio"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"os/signal"
@@ -210,8 +211,13 @@ func isPermissionErr(err error) bool {
 }
 
 func isConflictErr(err error) bool {
-	_, ok := err.(*core.ConcurrentChangeError)
-	return ok
+	if err == nil {
+		return false
+	}
+	if _, ok := err.(*core.ConcurrentChangeError); ok {
+		return true
+	}
+	return errors.Is(err, core.ErrWriteLocked)
 }
 
 func ok(format string, a ...any) int {
@@ -316,6 +322,8 @@ func cmdRestore(store *core.Store, args []string) int {
 	if err != nil {
 		return exitFor(err)
 	}
+	// 在让用户确认之前取哈希：之后若 hosts 被外部改过，写入会中止而不是静默覆盖。
+	expectHash := currentHash(store)
 	if !yes {
 		cur, _ := store.ReadCurrentHosts()
 		target, _ := store.SnapshotContent(snap)
@@ -329,7 +337,7 @@ func cmdRestore(store *core.Store, args []string) int {
 			return 0
 		}
 	}
-	res, err := store.RestoreSnapshotGuarded(names[0], currentHash(store))
+	res, err := store.RestoreSnapshotGuarded(names[0], expectHash)
 	if err != nil {
 		return exitFor(err)
 	}
@@ -344,6 +352,8 @@ func cmdRestoreOriginal(store *core.Store, args []string) int {
 			yes = true
 		}
 	}
+	// 在确认前取哈希：确认期间若 hosts 被外部修改，恢复会中止，不静默覆盖。
+	expectHash := currentHash(store)
 	if !yes {
 		cur, _ := store.ReadCurrentHosts()
 		fmt.Println("⚠ 紧急恢复：将 hosts 还原为首次运行时的系统原始备份。")
@@ -355,7 +365,7 @@ func cmdRestoreOriginal(store *core.Store, args []string) int {
 			return 0
 		}
 	}
-	res, err := store.RestoreOriginal()
+	res, err := store.RestoreOriginalGuarded(expectHash)
 	if err != nil {
 		return exitFor(err)
 	}
@@ -372,12 +382,13 @@ func cmdUndo(store *core.Store) int {
 	}
 	fmt.Printf("将撤销：%s（%s）\n", la.Actor, la.At)
 	fmt.Printf("回到快照：「%s」\n", la.SnapshotName)
+	expectHash := currentHash(store)
 	fmt.Print("确认撤销？(y/N)：")
 	if !confirm() {
 		fmt.Println("已取消。")
 		return 0
 	}
-	res, err := store.Undo()
+	res, err := store.UndoGuarded(expectHash)
 	if err != nil {
 		return exitFor(err)
 	}
@@ -675,12 +686,14 @@ func cmdSubscribe(store *core.Store, args []string) int {
 		return exitValidation
 	}
 	fmt.Printf("拉取成功（%d 字节），校验通过。\n", len(content))
+	// 拉取可能耗时；在提示确认前重新取当前哈希，确认期间被外部改过则拒绝写入。
+	expectHash := currentHash(store)
 	fmt.Print("确认写入 hosts？(y/N)：")
 	if !confirm() {
 		fmt.Println("已取消，内容未写入。")
 		return 0
 	}
-	res, err := store.ApplyHosts(content, "应用订阅 "+args[0])
+	res, err := store.ApplyHostsGuarded(content, "应用订阅 "+args[0], expectHash)
 	if err != nil {
 		return exitFor(err)
 	}
@@ -773,7 +786,7 @@ func interactive(version string) int {
 				fmt.Println("序号不对。")
 				continue
 			}
-			res, err := store.ApplyProfile(profs[idx].Name)
+			res, err := store.ApplyProfileGuarded(profs[idx].Name, currentHash(store))
 			if err != nil {
 				fmt.Println("失败：" + friendlyExit(err))
 				continue

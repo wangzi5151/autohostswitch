@@ -150,17 +150,29 @@ func (s *Store) applyHostsGuarded(content, actor, expectHash string) (*ApplyResu
 		snapName = safety.Name
 	}
 	s.appendLogEntry(s.Source, actor, "成功", snapName)
+	if w := WarningsText(issues); w != "" {
+		res.Warnings = w
+	}
 	// 记录写入后的哈希，供“外部修改检测”用
 	m := s.getMeta()
 	m.LastKnownHash = HashHosts(content)
 	s.setMeta(m)
-	_ = s.saveMeta()
-	if w := WarningsText(issues); w != "" {
-		res.Warnings = w
+	if err := s.saveMeta(); err != nil {
+		res.Warnings = addWarning(res.Warnings, "元数据保存失败："+err.Error())
 	}
 	// 记录“上一次写入”，供“撤销”使用（快照 ID + 操作描述）
-	s.recordLastApply(safety, actor)
+	if err := s.recordLastApply(safety, actor); err != nil {
+		res.Warnings = addWarning(res.Warnings, "撤销点保存失败："+err.Error())
+	}
 	return res, nil
+}
+
+// addWarning 把一条新警告拼到现有警告文本后面。
+func addWarning(dst, msg string) string {
+	if dst == "" {
+		return "⚠ " + msg
+	}
+	return dst + "\n⚠ " + msg
 }
 
 // shortErr 把错误信息截短，适合记日志（一行）。

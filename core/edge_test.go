@@ -2,6 +2,7 @@ package core
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -9,7 +10,9 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 )
 
 // ---------- 快照异常 ----------
@@ -341,14 +344,30 @@ func BenchmarkExportImport_10MB(b *testing.B) {
 // ---------- 并发回归（审计 #1）：meta 读写锁 ----------
 
 // TestMetaConcurrentRace 并发 ExternalModified + 写入记哈希，-race 下不应报竞态。
+// 写入锁是“不等待、直接拒绝”的，所以这里对 ErrWriteLocked 做短暂重试；
+// 其他错误一律上报，不再静默忽略写入失败。
 func TestMetaConcurrentRace(t *testing.T) {
 	s := testStore(t, "127.0.0.1 localhost\n")
 	var wg sync.WaitGroup
+	var successes int32
 	for i := 0; i < 8; i++ {
 		wg.Add(2)
 		go func(i int) {
 			defer wg.Done()
-			_, _ = s.ApplyHosts(fmt.Sprintf("127.0.0.1 localhost\n127.0.0.%d x%d.test\n", i%250+1, i), "test")
+			content := fmt.Sprintf("127.0.0.1 localhost\n127.0.0.%d x%d.test\n", i%250+1, i)
+			for attempt := 0; ; attempt++ {
+				_, err := s.ApplyHosts(content, "test")
+				if err == nil {
+					atomic.AddInt32(&successes, 1)
+					return
+				}
+				if errors.Is(err, ErrWriteLocked) && attempt < 500 {
+					time.Sleep(time.Millisecond)
+					continue
+				}
+				t.Errorf("并发写入失败：%v", err)
+				return
+			}
 		}(i)
 		go func() {
 			defer wg.Done()
@@ -356,6 +375,9 @@ func TestMetaConcurrentRace(t *testing.T) {
 		}()
 	}
 	wg.Wait()
+	if got := atomic.LoadInt32(&successes); got != 8 {
+		t.Fatalf("应有 8 次写入成功，实际 %d", got)
+	}
 	// meta 落盘后仍是合法 JSON 且关键字段没丢
 	data, err := os.ReadFile(s.metaPath())
 	if err != nil {
@@ -381,5 +403,87 @@ func TestPullSubscriptionTooLarge(t *testing.T) {
 		t.Fatal("超 2MB 的订阅应被拒绝")
 	} else if !strings.Contains(err.Error(), "2MB") {
 		t.Fatalf("错误信息应提到 2MB：%v", err)
+	}
+}
+
+// ---------- 并发索引回归：读-改-写必须串行，不能丢条目 ----------
+
+func TestConcurrentSnapshotCreatesNoLostEntries(t *testing.T) {
+	s := testStore(t, "127.0.0.1 localhost\n")
+	const n = 40
+	var wg sync.WaitGroup
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			content := fmt.Sprintf("127.0.0.1 h%d.local\n", i)
+			if _, err := s.CreateSnapshotOfContent(fmt.Sprintf("并发快照 %d", i), "", []byte(content), false); err != nil {
+				t.Errorf("创建快照失败：%v", err)
+			}
+		}(i)
+	}
+	wg.Wait()
+	list, err := s.ListSnapshots()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(list) != n+1 { // n 个手动 + 1 个原始备份
+		t.Fatalf("并发创建后应保留 %d 个快照，实际 %d（索引条目丢失）", n+1, len(list))
+	}
+}
+
+func TestConcurrentProfileCreatesNoLostEntries(t *testing.T) {
+	s := testStore(t, "127.0.0.1 localhost\n")
+	const n = 30
+	var wg sync.WaitGroup
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			content := fmt.Sprintf("127.0.0.1 p%d.local\n", i)
+			if _, err := s.CreateProfile(fmt.Sprintf("并发配置 %d", i), "", content); err != nil {
+				t.Errorf("创建配置失败：%v", err)
+			}
+		}(i)
+	}
+	wg.Wait()
+	list, err := s.ListProfiles()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(list) != n {
+		t.Fatalf("并发创建后应保留 %d 个配置，实际 %d（索引条目丢失）", n, len(list))
+	}
+}
+
+func TestConcurrentLogAppendsNoInterleaving(t *testing.T) {
+	s := testStore(t, "127.0.0.1 localhost\n")
+	const n = 50
+	var wg sync.WaitGroup
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			s.appendLog(fmt.Sprintf("并发日志 %d", i))
+		}(i)
+	}
+	wg.Wait()
+	lines, err := s.ReadLog()
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := 0
+	for _, l := range lines {
+		if strings.Contains(l, "并发日志") {
+			got++
+		}
+	}
+	if got != n {
+		t.Fatalf("并发追加后应有 %d 行并发日志，实际 %d", n, got)
+	}
+	for _, l := range lines {
+		if strings.Contains(l, "并发日志") && !strings.Contains(l, "成功") {
+			t.Fatalf("日志行被写花：%q", l)
+		}
 	}
 }

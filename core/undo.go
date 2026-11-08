@@ -23,9 +23,9 @@ func (s *Store) lastApplyPath() string { return filepath.Join(s.DataDir, "last_a
 
 // recordLastApply 在每次成功写入后记录撤销点。写入失败时不调用，
 // 所以 last_apply.json 永远指向“最后一次成功的写入之前”的状态。
-func (s *Store) recordLastApply(safety *Snapshot, actor string) {
+func (s *Store) recordLastApply(safety *Snapshot, actor string) error {
 	if safety == nil {
-		return
+		return nil
 	}
 	la := lastApply{
 		SnapshotID:   safety.ID,
@@ -35,14 +35,18 @@ func (s *Store) recordLastApply(safety *Snapshot, actor string) {
 	}
 	data, err := json.MarshalIndent(la, "", "  ")
 	if err != nil {
-		return
+		return err
 	}
-	_ = os.WriteFile(s.lastApplyPath(), data, 0o644)
+	s.undoMu.Lock()
+	defer s.undoMu.Unlock()
+	return atomicWriteFile(s.lastApplyPath(), data, 0o644)
 }
 
 // LastApplyState 返回当前是否可以撤销，以及撤销会回到哪个状态。
 // ok=false 表示没有可撤销的操作（比如数据目录被清空过，或撤销用的快照被手动删了）。
 func (s *Store) LastApplyState() (la lastApply, ok bool) {
+	s.undoMu.Lock()
+	defer s.undoMu.Unlock()
 	data, err := os.ReadFile(s.lastApplyPath())
 	if err != nil {
 		return lastApply{}, false
@@ -60,6 +64,8 @@ func (s *Store) LastApplyState() (la lastApply, ok bool) {
 
 // clearLastApply 清除撤销点：撤销用的快照找不到了，撤销点已无意义，清理掉。
 func (s *Store) clearLastApply() {
+	s.undoMu.Lock()
+	defer s.undoMu.Unlock()
 	_ = os.Remove(s.lastApplyPath())
 }
 
@@ -68,6 +74,12 @@ func (s *Store) clearLastApply() {
 // 原子写入 + 写入锁），并会产生新的撤销点，所以可以在改前/改后之间来回切换——
 // 每一步都有快照，不会丢。
 func (s *Store) Undo() (*ApplyResult, error) {
+	return s.UndoGuarded("")
+}
+
+// UndoGuarded 同 Undo，但多一层并发保护：expectHash 非空时，
+// 要求撤销写入瞬间的 hosts 哈希与用户在界面上看到的一致。
+func (s *Store) UndoGuarded(expectHash string) (*ApplyResult, error) {
 	la, ok := s.LastApplyState()
 	if !ok {
 		return nil, errors.New("没有可撤销的操作（本次数据目录下还没有成功写入过 hosts，或撤销用的快照被删了）")
@@ -83,7 +95,7 @@ func (s *Store) Undo() (*ApplyResult, error) {
 	}
 	// 注意：不要先清撤销点。ApplyHosts 成功后会自动把撤销点更新为
 	// “撤销前”的状态（可来回切换）；如果写入失败，旧撤销点保留仍然有效。
-	res, err := s.ApplyHosts(string(content), fmt.Sprintf("撤销上一次操作（%s）", la.Actor))
+	res, err := s.ApplyHostsGuarded(string(content), fmt.Sprintf("撤销上一次操作（%s）", la.Actor), expectHash)
 	if err != nil {
 		return nil, err
 	}

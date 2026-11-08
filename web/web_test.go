@@ -1,6 +1,7 @@
 package web
 
 import (
+	"encoding/json"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -256,5 +257,191 @@ func TestIsLocalOrigin(t *testing.T) {
 		if isLocalOrigin(o) {
 			t.Errorf("%q 不应判为本地", o)
 		}
+	}
+}
+
+// newWritableServer 建一个带真实 hosts 文件的测试 Server。
+func newWritableServer(t *testing.T, hostsContent string) *Server {
+	t.Helper()
+	dir := t.TempDir()
+	hosts := dir + "/hosts"
+	if err := os.WriteFile(hosts, []byte(hostsContent), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	st, err := core.NewStoreWith(hosts, dir+"/data")
+	if err != nil {
+		t.Fatal(err)
+	}
+	return NewServer(st, "test")
+}
+
+func doAPI(sv *Server, method, path, body string) *httptest.ResponseRecorder {
+	var r io.Reader
+	if body != "" {
+		r = strings.NewReader(body)
+	}
+	req := apiReq(sv, method, path, r)
+	rec := httptest.NewRecorder()
+	sv.Handler().ServeHTTP(rec, req)
+	return rec
+}
+
+func decodeMap(t *testing.T, rec *httptest.ResponseRecorder) map[string]any {
+	t.Helper()
+	var m map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &m); err != nil {
+		t.Fatalf("响应不是 JSON：%v（%s）", err, rec.Body.String())
+	}
+	return m
+}
+
+func TestGetHostsContract(t *testing.T) {
+	sv := newWritableServer(t, "127.0.0.1 localhost\n10.0.0.1 nas.local\n")
+	rec := doAPI(sv, "GET", "/api/hosts", "")
+	if rec.Code != 200 {
+		t.Fatalf("GET /api/hosts = %d", rec.Code)
+	}
+	m := decodeMap(t, rec)
+	if got, _ := m["content"].(string); got != "127.0.0.1 localhost\n10.0.0.1 nas.local\n" {
+		t.Fatalf("content 字段不对：%q", got)
+	}
+	if got, _ := m["hosts_path"].(string); got != sv.Store.HostsPath {
+		t.Fatalf("hosts_path 字段不对：%q", got)
+	}
+	if got, _ := m["content_hash"].(string); got == "" {
+		t.Fatal("content_hash 不应为空")
+	}
+	if _, exists := m["path"]; exists {
+		t.Fatal("不应再把正文放在 path 字段里（契约改为 content/hosts_path）")
+	}
+}
+
+func TestPostHostsGuardConflict(t *testing.T) {
+	sv := newWritableServer(t, "127.0.0.1 localhost\n")
+	m := decodeMap(t, doAPI(sv, "GET", "/api/hosts", ""))
+	hash := m["content_hash"].(string)
+	// 模拟外部程序在用户编辑期间改了 hosts
+	if err := os.WriteFile(sv.Store.HostsPath, []byte("10.1.1.1 evil.local\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	rec := doAPI(sv, "POST", "/api/hosts",
+		`{"content":"127.0.0.1 localhost\n1.1.1.1 dns.local\n","expected_hash":"`+hash+`"}`)
+	if rec.Code != 409 {
+		t.Fatalf("哈希不一致应 409，实际 %d（%s）", rec.Code, rec.Body.String())
+	}
+	data, _ := os.ReadFile(sv.Store.HostsPath)
+	if string(data) != "10.1.1.1 evil.local\n" {
+		t.Fatalf("并发冲突时不能覆盖外部修改，实际：%q", data)
+	}
+	// 重新读取后带新哈希可以写入
+	m = decodeMap(t, doAPI(sv, "GET", "/api/hosts", ""))
+	rec = doAPI(sv, "POST", "/api/hosts",
+		`{"content":"127.0.0.1 localhost\n1.1.1.1 dns.local\n","expected_hash":"`+m["content_hash"].(string)+`"}`)
+	if rec.Code != 200 {
+		t.Fatalf("哈希一致时应 200，实际 %d（%s）", rec.Code, rec.Body.String())
+	}
+}
+
+func TestRestoreSnapshotGuardedHTTP(t *testing.T) {
+	sv := newWritableServer(t, "127.0.0.1 localhost\n")
+	snap, err := sv.Store.CreateSnapshot("目标", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := decodeMap(t, doAPI(sv, "GET", "/api/hosts", ""))
+	staleHash := m["content_hash"].(string)
+	if err := os.WriteFile(sv.Store.HostsPath, []byte("10.1.1.1 changed.local\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	rec := doAPI(sv, "POST", "/api/snapshots/"+snap.ID+"/restore",
+		`{"expected_hash":"`+staleHash+`"}`)
+	if rec.Code != 409 {
+		t.Fatalf("恢复带过期哈希应 409，实际 %d（%s）", rec.Code, rec.Body.String())
+	}
+	data, _ := os.ReadFile(sv.Store.HostsPath)
+	if string(data) != "10.1.1.1 changed.local\n" {
+		t.Fatalf("冲突时不应写入，实际：%q", data)
+	}
+	m = decodeMap(t, doAPI(sv, "GET", "/api/hosts", ""))
+	rec = doAPI(sv, "POST", "/api/snapshots/"+snap.ID+"/restore",
+		`{"expected_hash":"`+m["content_hash"].(string)+`"}`)
+	if rec.Code != 200 {
+		t.Fatalf("哈希一致时恢复应 200，实际 %d（%s）", rec.Code, rec.Body.String())
+	}
+	data, _ = os.ReadFile(sv.Store.HostsPath)
+	if string(data) != "127.0.0.1 localhost\n" {
+		t.Fatalf("恢复后内容不对：%q", data)
+	}
+}
+
+func TestApplyProfileGuardedHTTP(t *testing.T) {
+	sv := newWritableServer(t, "127.0.0.1 localhost\n")
+	p, err := sv.Store.CreateProfile("开发", "", "127.0.0.1 dev.local\n")
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := decodeMap(t, doAPI(sv, "GET", "/api/hosts", ""))
+	staleHash := m["content_hash"].(string)
+	if err := os.WriteFile(sv.Store.HostsPath, []byte("10.2.2.2 changed.local\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	rec := doAPI(sv, "POST", "/api/profiles/"+p.ID+"/apply",
+		`{"expected_hash":"`+staleHash+`"}`)
+	if rec.Code != 409 {
+		t.Fatalf("应用配置带过期哈希应 409，实际 %d（%s）", rec.Code, rec.Body.String())
+	}
+	m = decodeMap(t, doAPI(sv, "GET", "/api/hosts", ""))
+	rec = doAPI(sv, "POST", "/api/profiles/"+p.ID+"/apply",
+		`{"expected_hash":"`+m["content_hash"].(string)+`"}`)
+	if rec.Code != 200 {
+		t.Fatalf("哈希一致时应用应 200，实际 %d（%s）", rec.Code, rec.Body.String())
+	}
+}
+
+func TestRestoreOriginalGuardedHTTP(t *testing.T) {
+	sv := newWritableServer(t, "127.0.0.1 localhost\n")
+	m := decodeMap(t, doAPI(sv, "GET", "/api/hosts", ""))
+	staleHash := m["content_hash"].(string)
+	if err := os.WriteFile(sv.Store.HostsPath, []byte("10.3.3.3 changed.local\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	rec := doAPI(sv, "POST", "/api/restore-original", `{"expected_hash":"`+staleHash+`"}`)
+	if rec.Code != 409 {
+		t.Fatalf("原始恢复带过期哈希应 409，实际 %d（%s）", rec.Code, rec.Body.String())
+	}
+	data, _ := os.ReadFile(sv.Store.HostsPath)
+	if string(data) != "10.3.3.3 changed.local\n" {
+		t.Fatalf("冲突时不应写入，实际：%q", data)
+	}
+}
+
+func TestUndoGuardedHTTP(t *testing.T) {
+	sv := newWritableServer(t, "127.0.0.1 localhost\n")
+	if _, err := sv.Store.ApplyHosts("127.0.0.1 localhost\n1.1.1.1 dns.local\n", "测试"); err != nil {
+		t.Fatal(err)
+	}
+	m := decodeMap(t, doAPI(sv, "GET", "/api/hosts", ""))
+	staleHash := m["content_hash"].(string)
+	if err := os.WriteFile(sv.Store.HostsPath, []byte("10.4.4.4 changed.local\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	rec := doAPI(sv, "POST", "/api/undo", `{"expected_hash":"`+staleHash+`"}`)
+	if rec.Code != 409 {
+		t.Fatalf("撤销带过期哈希应 409，实际 %d（%s）", rec.Code, rec.Body.String())
+	}
+}
+
+func TestWriteLockedReturns409(t *testing.T) {
+	sv := newWritableServer(t, "127.0.0.1 localhost\n")
+	m := decodeMap(t, doAPI(sv, "GET", "/api/hosts", ""))
+	lk, err := core.LockWrite(sv.Store.DataDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lk.Unlock()
+	rec := doAPI(sv, "POST", "/api/hosts",
+		`{"content":"127.0.0.1 localhost\n1.1.1.1 dns.local\n","expected_hash":"`+m["content_hash"].(string)+`"}`)
+	if rec.Code != 409 {
+		t.Fatalf("写入锁被占用应 409，实际 %d（%s）", rec.Code, rec.Body.String())
 	}
 }

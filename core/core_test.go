@@ -102,9 +102,15 @@ func TestSnapshotRoundTrip(t *testing.T) {
 	if _, err := s.GetSnapshot("改名后"); err != nil {
 		t.Fatal(err)
 	}
-	// 原始备份拒绝删除
+	// 原始备份拒绝删除：按 ID 和按 Name 都必须删不掉（回归：曾只校验 ID）
 	if err := s.DeleteSnapshot(s.OriginalSnapshotID()); err == nil {
-		t.Fatal("原始备份应该删不掉")
+		t.Fatal("原始备份应该删不掉（按 ID）")
+	}
+	if err := s.DeleteSnapshot("系统原始备份"); err == nil {
+		t.Fatal("原始备份应该删不掉（按名字）")
+	}
+	if _, err := s.GetSnapshot(s.OriginalSnapshotID()); err != nil {
+		t.Fatal("按名字删除被拒绝后，原始备份必须仍然存在")
 	}
 	if err := s.DeleteSnapshot("改名后"); err != nil {
 		t.Fatal(err)
@@ -478,5 +484,60 @@ func TestUndoAfterSnapshotDeleted(t *testing.T) {
 	}
 	if _, err := s.Undo(); err == nil {
 		t.Fatal("快照被删后撤销应报错")
+	}
+}
+
+func TestSnapshotRetentionMinOneKeepsUndo(t *testing.T) {
+	t.Setenv("AUTOHOSTSWITCH_AUTO_SNAP_MAX", "0")
+	if got := maxAutoSnapshots(); got != 1 {
+		t.Fatalf("上限 0 应被夹到 1，实际 %d", got)
+	}
+	s := testStore(t, "127.0.0.1 localhost\n")
+	if _, err := s.ApplyHosts("127.0.0.1 localhost\n1.1.1.1 one.example\n", "第一次"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.ApplyHosts("127.0.0.1 localhost\n1.1.1.1 one.example\n9.9.9.9 dns.example\n", "第二次"); err != nil {
+		t.Fatal(err)
+	}
+	la, ok := s.LastApplyState()
+	if !ok {
+		t.Fatal("上限为 1 时撤销点也必须保留")
+	}
+	if _, err := s.GetSnapshot(la.SnapshotID); err != nil {
+		t.Fatalf("撤销点引用的安全快照被误删：%v", err)
+	}
+	if _, err := s.Undo(); err != nil {
+		t.Fatalf("上限为 1 时 Undo 仍应可用：%v", err)
+	}
+}
+
+func TestSeedDefaultProfileUsesOriginalSnapshot(t *testing.T) {
+	s := testStore(t, "127.0.0.1 localhost\n")
+	original := "127.0.0.1 localhost\n"
+	// 模拟用户改过 hosts 之后才首次种配置
+	if _, err := s.ApplyHosts("127.0.0.1 localhost\n10.0.0.1 changed.local\n", "改过"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SeedDefaultProfile(); err != nil {
+		t.Fatal(err)
+	}
+	p, err := s.GetProfile("重置默认")
+	if err != nil {
+		t.Fatal(err)
+	}
+	content, err := s.ProfileContent(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if content != NormalizeHosts(original) {
+		t.Fatalf("默认配置应来自原始快照 %q，实际 %q", original, content)
+	}
+	// 幂等：再种一次不报错、不重复
+	if err := s.SeedDefaultProfile(); err != nil {
+		t.Fatal(err)
+	}
+	list, _ := s.ListProfiles()
+	if len(list) != 1 {
+		t.Fatalf("重复 Seed 不应新增配置，got %d", len(list))
 	}
 }

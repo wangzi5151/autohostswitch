@@ -305,10 +305,17 @@ async function liveValidate(){
 }
 async function loadHosts(){
   const r=await api("/api/hosts");
-  $("ta").value=r.path;
+  $("ta").value=r.content;
   window.hostsHash=r.content_hash||"";
+  window.hostsPath=r.hosts_path||"";
   $("hosts-meta").textContent="共 "+r.total_lines+" 行，其中 "+r.active_lines+" 条有效映射 · "+(r.writable?"当前身份可直接写入":"当前身份不可写，保存前请先提权");
   renderHL(); liveValidate();
+}
+// 在确认/提交前重新读取磁盘上的当前哈希，随写请求提交给后端做并发 guard。
+async function freshHash(){
+  const r=await api("/api/hosts");
+  window.hostsHash=r.content_hash||"";
+  return window.hostsHash;
 }
 function stepsText(r){
   // 把后端返回的执行阶段拼成一行：已校验 → 已备份 → 已写入 → 已验证
@@ -384,9 +391,10 @@ async function snapAct(act,id){
       const s=sl.find(x=>x.id===id);
       const curLines=$("ta").value?$("ta").value.split("\n").length:0;
       const tgt=s&&s.lines!=null?s.lines:"?";
+      const expected=await freshHash();
       if(!confirmIt("确定从快照恢复？\n\n当前 hosts："+curLines+" 行\n目标快照："+tgt+" 行"+
         (s?"（"+s.name+"）":"")+"\n\n恢复后当前修改将被覆盖（恢复前会自动再存一份安全快照）。"))return;
-      const r=await api("/api/snapshots/"+id+"/restore","POST");
+      const r=await api("/api/snapshots/"+id+"/restore","POST",{expected_hash:expected});
       alert("已恢复。"+stepsText(r)+(r.warnings?"\n"+r.warnings:"")); loadHosts(); loadSnaps(); loadUndoState();
     }else if(act==="rename"){
       const name=prompt("新名字："); if(!name)return;
@@ -431,9 +439,12 @@ async function profAct(act,id){
         const d=await api("/api/diff?from=current&to="+encodeURIComponent("profile:"+id));
         const preview=d.lines.slice(0,30).map(l=>l.op+" "+l.text).join("\n");
         const more=d.lines.length>30?("\n…（共 "+d.lines.length+" 行，只显示前 30 行）"):"";
+        const expected=await freshHash();
         if(!confirmIt("应用后将："+diffStatsText(d)+"\n\n"+preview+more+"\n\n确定应用吗？应用前会自动备份当前 hosts。"))return;
+        var applyHash=expected;
       }catch(e){ if(!confirmIt("diff 预览失败（"+e.message+"），仍要应用吗？"))return; }
-      const r=await api("/api/profiles/"+id+"/apply","POST");
+      if(typeof applyHash==="undefined")var applyHash=await freshHash();
+      const r=await api("/api/profiles/"+id+"/apply","POST",{expected_hash:applyHash});
       alert("已应用。"+stepsText(r)+(r.warnings?"\n"+r.warnings:"")); loadHosts(); loadUndoState();
     }else if(act==="edit"){
       const r=await api("/api/profiles/"+id);
@@ -521,8 +532,9 @@ function bind(){
     try{
       const st=await api("/api/undo-state");
       if(!st.can_undo){alert("没有可撤销的操作。");return;}
+      const expected=await freshHash();
       if(!confirmIt("撤销上一次操作？\n\n将撤销："+st.actor+"（"+st.at+"）\n回到快照：「"+st.snapshot_name+"」"))return;
-      const r=await api("/api/undo","POST");
+      const r=await api("/api/undo","POST",{expected_hash:expected});
       showMsg($("save-msg"),true,("已撤销上一次操作。"+stepsText(r)+(r.warnings?"\n"+r.warnings:"")));
       loadHosts(); loadStatus(); loadUndoState();
     }catch(e){showMsg($("save-msg"),false,e.message);}
@@ -543,7 +555,7 @@ function bind(){
     }catch(e){alert("失败："+e.message);}
   };
   $("btn-prof-fromcur").onclick=async()=>{
-    try{const r=await api("/api/hosts");$("prof-content").value=r.path;}
+    try{const r=await api("/api/hosts");$("prof-content").value=r.content;}
     catch(e){alert("失败："+e.message);}
   };
   $("btn-prof-create").onclick=async()=>{
@@ -568,9 +580,10 @@ function bind(){
     }catch(e){showMsg($("backup-msg"),false,e.message);}
   };
   $("btn-restore-orig").onclick=async()=>{
-    if(!confirmIt("确定恢复为系统原始 hosts 吗？当前内容会先自动备份，可反悔。"))return;
     try{
-      const r=await api("/api/restore-original","POST");
+      const expected=await freshHash();
+      if(!confirmIt("确定恢复为系统原始 hosts 吗？当前内容会先自动备份，可反悔。"))return;
+      const r=await api("/api/restore-original","POST",{expected_hash:expected});
       showMsg($("restore-msg"),true,r.warnings?("已恢复为系统原始 hosts。\n"+r.warnings):"已恢复为系统原始 hosts。");
       loadHosts(); loadUndoState();
     }catch(e){showMsg($("restore-msg"),false,e.message);}
@@ -601,7 +614,8 @@ function bind(){
       const ab=$("btn-sub-apply");
       if(ab)ab.onclick=async()=>{
         try{
-          const rr=await api("/api/hosts","POST",{content:r.content});
+          const expected=await freshHash();
+          const rr=await api("/api/hosts","POST",{content:r.content,expected_hash:expected});
           alert(rr.warnings?("已应用。\n"+rr.warnings):"订阅已应用到 hosts。");loadHosts();loadUndoState();
         }catch(e){alert("失败："+e.message);}
       };

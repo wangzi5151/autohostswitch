@@ -6,7 +6,6 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
-	"time"
 )
 
 // Profile 是一套 hosts 配置方案（如「开发环境」「屏蔽广告」）。
@@ -73,12 +72,14 @@ func (s *Store) CreateProfile(name, note, content string) (*Profile, error) {
 	if issues := ValidateHosts(content); HasError(issues) {
 		return nil, &ValidationError{Issues: issues}
 	}
+	s.dataMu.Lock()
+	defer s.dataMu.Unlock()
 	if _, err := s.GetProfile(name); err == nil {
 		return nil, fmt.Errorf("已存在同名配置「%s」，请换个名字", name)
 	}
 	p := Profile{ID: newID(), Name: name, Note: note,
 		CreatedAt: nowStr(), UpdatedAt: nowStr(), FormatVersion: ProfileFormatVersion}
-	if err := os.WriteFile(s.profileFile(p.ID), []byte(NormalizeHosts(content)), 0o644); err != nil {
+	if err := atomicWriteFile(s.profileFile(p.ID), []byte(NormalizeHosts(content)), 0o644); err != nil {
 		return nil, fmt.Errorf("保存配置内容失败：%w", err)
 	}
 	list, err := s.loadProfiles()
@@ -131,11 +132,13 @@ func (s *Store) UpdateProfileContent(idOrName, content string) error {
 	if issues := ValidateHosts(content); HasError(issues) {
 		return &ValidationError{Issues: issues}
 	}
+	s.dataMu.Lock()
+	defer s.dataMu.Unlock()
 	p, err := s.GetProfile(idOrName)
 	if err != nil {
 		return err
 	}
-	if err := os.WriteFile(s.profileFile(p.ID), []byte(NormalizeHosts(content)), 0o644); err != nil {
+	if err := atomicWriteFile(s.profileFile(p.ID), []byte(NormalizeHosts(content)), 0o644); err != nil {
 		return fmt.Errorf("保存配置内容失败：%w", err)
 	}
 	list, err := s.loadProfiles()
@@ -156,6 +159,8 @@ func (s *Store) RenameProfile(idOrName, newName string) error {
 	if newName == "" {
 		return fmt.Errorf("新名字不能为空")
 	}
+	s.dataMu.Lock()
+	defer s.dataMu.Unlock()
 	if cur, err := s.GetProfile(idOrName); err == nil && cur.Name == newName {
 		return nil // 改成相同的名字：无操作，直接成功
 	}
@@ -179,6 +184,8 @@ func (s *Store) RenameProfile(idOrName, newName string) error {
 
 // DeleteProfile 删除配置。
 func (s *Store) DeleteProfile(idOrName string) error {
+	s.dataMu.Lock()
+	defer s.dataMu.Unlock()
 	list, err := s.loadProfiles()
 	if err != nil {
 		return err
@@ -208,19 +215,32 @@ func (s *Store) ApplyProfile(idOrName string) (*ApplyResult, error) {
 	return s.ApplyHosts(content, fmt.Sprintf("应用配置「%s」", p.Name))
 }
 
-// SeedDefaultProfile 首次运行时种一颗“重置默认”配置，内容取自原始备份。
+// SeedDefaultProfile 首次运行时种一颗“重置默认”配置，内容取自「系统原始备份」快照。
 // 已存在则跳过，保证幂等。
+//
+// 不能读当前 hosts：首次运行时 hosts 可能已经被用户改过，那会把“默认配置”
+// 种成用户当前状态，失去“重置回最初样子”的意义。
 func (s *Store) SeedDefaultProfile() error {
 	if _, err := s.GetProfile("重置默认"); err == nil {
 		return nil
 	}
-	raw, err := os.ReadFile(s.HostsPath)
-	if err != nil {
-		raw = []byte("# 空 hosts\n")
+	var raw []byte
+	if id := s.OriginalSnapshotID(); id != "" {
+		if snap, err := s.GetSnapshot(id); err == nil {
+			if content, err := s.SnapshotContent(snap); err == nil {
+				raw = content
+			}
+		}
 	}
-	_, err = s.CreateProfile("重置默认", "回到系统最初的样子（首次运行时的 hosts）", string(raw))
-	// 时间戳函数在 CreateProfile 内部已处理
-	_ = time.Now
+	if raw == nil {
+		// 极端兜底（原始快照丢失/数据目录被手动清理）：再读当前 hosts。
+		cur, err := os.ReadFile(s.HostsPath)
+		if err != nil {
+			cur = []byte("# 空 hosts\n")
+		}
+		raw = cur
+	}
+	_, err := s.CreateProfile("重置默认", "回到系统最初的样子（首次运行时的 hosts）", string(raw))
 	return err
 }
 

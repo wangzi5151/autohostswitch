@@ -262,8 +262,13 @@ func writeErr(w http.ResponseWriter, code int, msg string) {
 
 // errCode 把写入类错误映射成 HTTP 状态码：409 留给并发冲突，
 // 前端据此提示用户“重新读取后再操作”。
+// ErrWriteLocked（另一个 AutoHostSwitch 正在写入）同样是并发冲突，也返回 409，
+// 而不是误导性的 400。
 func errCode(err error) int {
 	if _, ok := err.(*core.ConcurrentChangeError); ok {
+		return 409
+	}
+	if errors.Is(err, core.ErrWriteLocked) {
 		return 409
 	}
 	return 400
@@ -283,6 +288,26 @@ func readJSON(w http.ResponseWriter, r *http.Request, v any) error {
 	dec := json.NewDecoder(r.Body)
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(v); err != nil {
+		var mbe *http.MaxBytesError
+		if errors.As(err, &mbe) {
+			return ErrBodyTooLarge
+		}
+		return fmt.Errorf("请求 JSON 不合法或含未知字段：%w", err)
+	}
+	return nil
+}
+
+// readOptionalJSON 读取一个可省略的 JSON 请求体（如只传 expected_hash）。
+// 空请求体视为“不启用 guard”，不报错；其他错误沿用严格 JSON 规则。
+func readOptionalJSON(w http.ResponseWriter, r *http.Request, v any) error {
+	defer r.Body.Close()
+	r.Body = http.MaxBytesReader(w, r.Body, maxJSONBody)
+	dec := json.NewDecoder(r.Body)
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(v); err != nil {
+		if errors.Is(err, io.EOF) {
+			return nil
+		}
 		var mbe *http.MaxBytesError
 		if errors.As(err, &mbe) {
 			return ErrBodyTooLarge
@@ -422,7 +447,8 @@ func (sv *Server) handleGetHosts(w http.ResponseWriter, r *http.Request) {
 	writable, _ := platform.Writable(sv.Store.HostsPath)
 	total, active := core.CountStats(content)
 	writeJSON(w, 200, map[string]any{
-		"path": content, "writable": writable,
+		"content": content, "hosts_path": sv.Store.HostsPath,
+		"writable":    writable,
 		"total_lines": total, "active_lines": active,
 		"content_hash": core.HashHosts(content),
 	})
@@ -559,7 +585,14 @@ func (sv *Server) handleRestoreSnapshot(w http.ResponseWriter, r *http.Request) 
 	if !ok {
 		return
 	}
-	res, err := sv.Store.RestoreSnapshot(id)
+	var req struct {
+		ExpectedHash string `json:"expected_hash"`
+	}
+	if err := readOptionalJSON(w, r, &req); err != nil {
+		writeReadErr(w, err)
+		return
+	}
+	res, err := sv.Store.RestoreSnapshotGuarded(id, req.ExpectedHash)
 	if err != nil {
 		writeErr(w, errCode(err), err.Error())
 		return
@@ -658,7 +691,14 @@ func (sv *Server) handleApplyProfile(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	res, err := sv.Store.ApplyProfile(id)
+	var req struct {
+		ExpectedHash string `json:"expected_hash"`
+	}
+	if err := readOptionalJSON(w, r, &req); err != nil {
+		writeReadErr(w, err)
+		return
+	}
+	res, err := sv.Store.ApplyProfileGuarded(id, req.ExpectedHash)
 	if err != nil {
 		writeErr(w, errCode(err), err.Error())
 		return
@@ -701,7 +741,14 @@ func (sv *Server) handleImport(w http.ResponseWriter, r *http.Request) {
 }
 
 func (sv *Server) handleRestoreOriginal(w http.ResponseWriter, r *http.Request) {
-	res, err := sv.Store.RestoreOriginal()
+	var req struct {
+		ExpectedHash string `json:"expected_hash"`
+	}
+	if err := readOptionalJSON(w, r, &req); err != nil {
+		writeReadErr(w, err)
+		return
+	}
+	res, err := sv.Store.RestoreOriginalGuarded(req.ExpectedHash)
 	if err != nil {
 		writeErr(w, errCode(err), err.Error())
 		return
@@ -820,7 +867,14 @@ func (sv *Server) handleUndoState(w http.ResponseWriter, r *http.Request) {
 
 // handleUndo 撤销上一次写入（POST，副作用操作，受 CSRF 保护）。
 func (sv *Server) handleUndo(w http.ResponseWriter, r *http.Request) {
-	res, err := sv.Store.Undo()
+	var req struct {
+		ExpectedHash string `json:"expected_hash"`
+	}
+	if err := readOptionalJSON(w, r, &req); err != nil {
+		writeReadErr(w, err)
+		return
+	}
+	res, err := sv.Store.UndoGuarded(req.ExpectedHash)
 	if err != nil {
 		writeErr(w, errCode(err), err.Error())
 		return
